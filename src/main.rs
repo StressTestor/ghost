@@ -50,8 +50,17 @@ fn main() {
                 );
             }
 
+            // full config wiring: --config or --gadgets seeds the armed list (select uses existing gadgets)
+            let mut g_list = gadgets;
+            if let Some(ref cfg) = _loaded_cfg
+                && !cfg.gadgets.is_empty()
+            {
+                g_list = cfg.gadgets.clone();
+            }
+            session.select_gadgets(&g_list);
+
             // list armed (voice descs from gadget trait / registry)
-            for g in default_gadgets() {
+            for g in &session.active_gadgets {
                 println!("  - {} : {}", g.name(), g.description());
             }
 
@@ -63,8 +72,16 @@ fn main() {
             let events = wrapper.run(dry_run);
             session.attach_with_interceptor(events);
 
-            // output: if headless use non-tui voice path (banners, roasts, output lines, summary). else real TUI (face, glitch, gadgets, status, log).
-            // (recording YAGNI for core TUI task; voice + events still fully in headless/TUI)
+            // basic recording save (for replay cmd). uses personality_lines + voice banners collected in session.
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let rec_id = format!("attach-{}", ts);
+            if let Ok(p) = session.save_recording(&rec_id) {
+                println!("recording saved: {} (use: ghost replay {})", p, ts);
+            }
+
             if is_headless {
                 let renderer = TuiRenderer::new();
                 renderer.run_headless(&session);
@@ -164,7 +181,10 @@ fn main() {
         }
 
         Commands::Replay { session_id } => {
-            println!("👻 replaying session {} (¬‿¬) they ALL talk eventually XX", session_id);
+            println!(
+                "👻 replaying session {} (¬‿¬) they ALL talk eventually XX",
+                session_id
+            );
             let _ = TuiRenderer::replay(&session_id);
             println!("replay done. zero chill 💀");
         }
@@ -180,14 +200,26 @@ fn main() {
             println!("(｡◕‿↼) they ALL talk eventually XX");
         }
 
-        Commands::Config { .. } => {
+        Commands::Config { show, path } => {
+            let p = path
+                .or(cli.config.clone())
+                .unwrap_or_else(|| "ghost.toml".to_string());
+            let cfg = if show {
+                GhostConfig::load(&p).unwrap_or_else(|_| GhostConfig::with_defaults())
+            } else {
+                GhostConfig::with_defaults()
+            };
+            println!("👻 ghost config (toml) at {} (¬‿¬)", p);
+            println!("  gadgets: {:?}", cfg.gadgets);
             println!(
-                "👻 ghost config (toml) (¬‿¬) use ghost.toml or --config on attach. they ALL talk eventually XX"
+                "  dry_run default: {} (safety. override with --dry-run=false)",
+                cfg.dry_run
             );
-            let cfg = GhostConfig::with_defaults();
+            println!("  voice: kaomoji_level={}", cfg.voice.kaomoji_level);
+            println!("  targets (for run): {:?}", cfg.targets);
             println!(
-                "  gadgets: {:?} dry={} kaomoji_level={}",
-                cfg.gadgets, cfg.dry_run, cfg.voice.kaomoji_level
+                "use --config {} on attach/run to load. they ALL talk eventually XX",
+                p
             );
         }
     }

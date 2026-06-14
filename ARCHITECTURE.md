@@ -2,7 +2,7 @@
 
 **ghost** 👻 cli + tui for live visibility + deliberate chaos injection into real agent tool calls, cli commands, local services. offensive research counterpart to sentinel. "they ALL talk eventually XX"
 
-last updated: 2026-06-14 (full ratatui TUI: GhostFaceWidget (kaomoji per GhostFaceState 5-7 lines + intensity color/glitch), ActivityCanvas (glitchy event stream !! + invert on high/party), GadgetBar (hotkeys+voice descs), status strip (ZERO CHILL etc), live log tail, overlays (help/confirm in voice), main TUI loop (crossterm poll/keys/q/1-9/space/h, consume Session), headless (tty/env or flag, voice prints), TDD Buffer tests + full suite 50+; updated main wiring + skeleton; ARCH sync)
+last updated: 2026-06-14 (full v1 CLI wiring: clap full subcommands attach/proxy/run/replay/gadgets/config + globals --headless/--config; toml serde GhostConfig+VoicePrefs+targets; session select_gadgets + save_recording; main dispatch with dry banners voice everywhere, headless path, replay load+face sim; integration TDD in tests/ + cli/src (voice asserts, dry-run banners, roundtrips, parse); all tests 50+ green, clippy -D/fmt clean; release verified; ARCH/voice per spec)
 
 ## project overview
 
@@ -115,23 +115,31 @@ none. pure local. (future easy: sentinel hook format compat, gstack health hooks
 - **real command wrapper live**: std::process in CommandWrapper.run(dry_run) does actual exec of user command (echo/ls etc tested), emits real captured lines as CommandOutput + banners. old Interceptor::start() kept for compat/skeleton. proxy is stub (no bind).
 - **tests use std::time::Instant**: no extra deps for timestamps in v1.
 - **clap trailing_var_arg for attach**: allows `ghost attach ./foo --bar` without eating flags. careful with subcommand parsing.
-- **TUI + headless/tty**: run uses is_terminal + GHOST_HEADLESS env for decision (no --headless flag on cli in v1 to keep surface minimal). interactive consumes owned Session (for gadget key activates that update face/logs). always clean exit (disable raw, leave alt). clippy/fmt clean. Buffer tests for widgets (no real term needed).
+- **full cli wiring v1**: clap globals --headless (or auto !tty), --config <toml> on all. subcommands: attach/proxy/run/replay/gadgets/config all dispatch to Session + CommandWrapper/ProxyStub (dry passed), TuiRenderer (headless or interactive), select_gadgets, save_recording. Config toml (gadgets/voice/targets) loads and seeds. Replay loads ghost-recording-<id>.txt (voice lines) + face sim prints. All output in exact voice.
+- **recordings**: simple .txt (personality_lines + banners) saved on attach/proxy/run exit to cwd as ghost-recording-*.txt . replay <id|path> replays with kaomoji cycle. basic, no serde on Event (Instant).
+- **TUI + headless/tty**: uses cli.headless || !stdout.is_terminal() for non-ratatui path (prints banners + roasts + events in voice via run_headless + personality). TUI run takes owned Session. clippy/fmt clean. Buffer tests + voice asserts.
 
 ## commands
 
 ```bash
 # dev
 cargo build
-cargo run -- --help
-cargo run -- attach echo hi --dry-run   # real wrapper: shows 👻 banner + captured events, voice kaomoji, no gadget mut in dry. in tty: full TUI (face flips, glitch activity, gadgets bar 1/2, status ZERO CHILL, log, keys q/1/h etc); else headless voice prints
-cargo run -- attach ls / --dry-run
-GHOST_HEADLESS=1 cargo run -- attach echo hi --dry-run  # force headless
-cargo run -- gadgets
+cargo run -- --help   # voice about + subcommands (attach with --gadgets --dry-run, proxy, run --config, replay <id>, gadgets, config)
+cargo run -- attach echo hi --dry-run   # real wrapper: 👻 ghost attached (observe only) ... (¬‿¬) they ALL talk eventually XX banner + events + roasts like "this agent just rated... (¬‿¬)" ; if tty full TUI, else headless voice prints + summary
+cargo run -- attach ls / --dry-run --gadgets poke
+cargo run -- --headless attach echo 'test' --dry-run  # text only, exact kaomoji roasts "zero chill 💀" "fuck off pete >:[" etc
+cargo run -- --config my.toml attach ...  # loads gadgets/voice/targets from toml
+cargo run -- gadgets   # lists with voice descs e.g. "roast -- rewrites responses with light mockery. zero chill detector 💀"
+cargo run -- config --show  # toml dump in voice
+cargo run -- run --config ghost.toml  # batch from targets + gadgets in toml
+cargo run -- replay 1718400000   # loads ghost-recording-*.txt , face cycle + voice lines replay
+cargo run -- replay attach-17184... 
 
 # test (tdd style, run often)
 cargo test
 cargo test -- --quiet
-cargo test tui   # or specific ghost_face_renders_kaomoji_for_state etc
+cargo test cli   # parse, globals, attach dry voice
+cargo test skeleton   # integration: cli, headless voice, replay, config roundtrip, attach_dry_run emits banners+roasts
 
 # lint + fmt (clean before commit)
 cargo fmt -- --check
