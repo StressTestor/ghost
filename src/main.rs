@@ -79,7 +79,9 @@ fn main() {
                 .as_secs();
             let rec_id = format!("attach-{}", ts);
             if let Ok(p) = session.save_recording(&rec_id) {
-                println!("recording saved: {} (use: ghost replay {})", p, ts);
+                // advertise the id we actually saved under (was printing the bare
+                // ts, which pointed replay at a file that does not exist).
+                println!("recording saved: {} (use: ghost replay {})", p, rec_id);
             }
 
             if is_headless {

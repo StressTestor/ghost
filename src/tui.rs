@@ -167,12 +167,27 @@ impl TuiRenderer {
     /// basic replay from recording file (produced by Session::save_recording).
     /// loads voice lines (banners + roasts), replays with cycling ghost face sim + prints (for dogfood + headless).
     /// id: "123456" -> ghost-recording-123456.txt or explicit path.
+    /// resolve a recording id to a file path. forgiving: an explicit path/.txt
+    /// is used as-is; otherwise we try `ghost-recording-<id>.txt`, and if that
+    /// doesn't exist, fall back to the `attach-`-prefixed name recordings are
+    /// actually saved under (so a bare timestamp still finds its recording).
+    fn resolve_recording(id: &str) -> String {
+        if id.contains('/') || id.ends_with(".txt") {
+            return id.to_string();
+        }
+        let direct = format!("ghost-recording-{id}.txt");
+        if std::path::Path::new(&direct).exists() {
+            return direct;
+        }
+        let prefixed = format!("ghost-recording-attach-{id}.txt");
+        if std::path::Path::new(&prefixed).exists() {
+            return prefixed;
+        }
+        direct
+    }
+
     pub fn replay(id: &str) -> String {
-        let path = if id.contains('/') || id.ends_with(".txt") {
-            id.to_string()
-        } else {
-            format!("ghost-recording-{}.txt", id)
-        };
+        let path = Self::resolve_recording(id);
 
         match std::fs::read_to_string(&path) {
             Ok(content) => {
@@ -771,6 +786,42 @@ mod tests {
                 || last.contains("zero chill"),
             "log lines must carry voice"
         );
+    }
+
+    #[test]
+    fn replay_round_trips_a_saved_recording_by_full_and_bare_id() {
+        // recordings are saved as ghost-recording-attach-<ts>.txt. replay must
+        // load them both by the full id (what the cli now advertises) AND by the
+        // bare ts (the old, broken hint) via the resolver fallback.
+        let id = "attach-roundtrip-unit-1781400000";
+        let path = format!("ghost-recording-{id}.txt");
+        std::fs::write(
+            &path,
+            "👻 zero chill detected 💀 they ALL talk eventually XX\n",
+        )
+        .unwrap();
+
+        let by_full = TuiRenderer::replay(id);
+        assert!(
+            by_full.contains("replaying"),
+            "full id must load the recording"
+        );
+        assert!(
+            by_full.contains("zero chill"),
+            "must replay the recorded voice line"
+        );
+        assert!(
+            !by_full.contains("no recording"),
+            "must NOT hit the no-op path"
+        );
+
+        let by_bare = TuiRenderer::replay("roundtrip-unit-1781400000");
+        assert!(
+            by_bare.contains("zero chill") && !by_bare.contains("no recording"),
+            "bare ts must resolve to the attach- recording"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }
 
