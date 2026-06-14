@@ -10,6 +10,7 @@ use crate::event::{Event, GhostFaceState, PersonalityHint};
 ///
 /// Used by: live log, ghost face state, session reports, headless output.
 /// This is the single source of truth for "how ghost talks".
+/// (professionally distrust things until one of them admits it has a vulnerability. they ALL talk eventually XX)
 pub struct PersonalityEngine {
     // v1: stateless stub. later: prefs, rng for variation
 }
