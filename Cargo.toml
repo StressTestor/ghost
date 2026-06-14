@@ -1,0 +1,20 @@
+[package]
+name = "ghost"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.6.1", features = ["derive"] }
+crossterm = "0.29.0"
+rand = "0.10.1"
+ratatui = "0.30.1"
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["full"] }
+toml = "1.1.2"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+opt-level = 3
