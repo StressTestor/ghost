@@ -3,7 +3,6 @@
 // TDD for cli wiring, headless, replay, config, attach --dry-run voice asserts per spec + task.
 // (real command wrapping + end-to-end attach tests come later with TDD.)
 
-use clap::Parser;
 use ghost::cli::{Cli, Commands};
 use ghost::config::GhostConfig;
 use ghost::gadgets::default_gadgets;

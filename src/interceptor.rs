@@ -235,14 +235,14 @@ mod tests {
                 ts,
             }];
             // capture last arg as "output" for echo tests etc. for real cmds would exec but stub
-            if let Some(last) = self.cmd.last() {
-                if !last.starts_with("definitely-not") {
-                    evs.push(Event::CommandOutput {
-                        line: last.clone(),
-                        stream: "stdout".into(),
-                        ts,
-                    });
-                }
+            if let Some(last) = self.cmd.last()
+                && !last.starts_with("definitely-not")
+            {
+                evs.push(Event::CommandOutput {
+                    line: last.clone(),
+                    stream: "stdout".into(),
+                    ts,
+                });
             }
             if self.cmd.iter().any(|c| c.contains("definitely-not")) {
                 evs.push(Event::LogLine {

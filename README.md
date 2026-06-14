@@ -45,6 +45,32 @@ cargo run -- gadgets
 
 requires rust 1.96+ (we pin via the toolchain that built it).
 
+## ghost + sentinel: the bridge 👻🛡️
+
+sentinel blocks the dangerous tool calls. ghost makes sure the agent feels bad about it.
+
+`ghost install` puts ghost in front of sentinel as the PreToolUse hook. on every tool call ghost runs its offense, hands the call to sentinel's policy, and when sentinel blocks something the agent tried, ghost roasts it in your voice. the agent reads the roast in the deny reason. you read it in `~/.ghost/blocks.log`.
+
+```bash
+# wire it up (idempotent, folds a standalone sentinel hook into the bridge)
+ghost install --sentinel /path/to/sentinel
+
+# what claude code runs per tool call (you don't run this by hand):
+printf '%s' '{"tool_name":"Bash","tool_input":{"command":"<a blocked thing>"}}' \
+  | ghost hook --sentinel /path/to/sentinel
+# block -> nested deny with the roast grafted into the reason
+#   "...credential vault was reached for. 👻 oh you wanted the secrets. cute. denied (｡◕‿↼) lmao XX"
+# allow -> {} (defers to claude code's normal prompt)
+```
+
+ghost is offense bolted onto defense, never a way around it:
+- never downgrades a sentinel deny. deny is final. >:[
+- never fabricates an allow. a non-block defers, untouched.
+- fails closed if sentinel is unreachable.
+- observe mode (default) never mutates the real payload.
+
+the roasts vary per block category (cred-access, pipe-to-shell, destructive, persistence, exfil) and are loud as hell. uninstall with `ghost install --uninstall`. full design in `docs/superpowers/specs/2026-06-14-ghost-sentinel-bridge-design.md`.
+
 ## example `ghost --help`
 
 ```
@@ -101,6 +127,8 @@ ghost proxy <addr>
 ghost run --config my-chaos.toml
 ghost replay <session-id>
 ghost gadgets
+ghost install --sentinel <path>      # wire the bridge into claude code (wraps sentinel)
+ghost hook --sentinel <path>         # the per-call bridge (claude code invokes this)
 ghost --help
 ```
 
@@ -144,7 +172,7 @@ update ARCHITECTURE.md on any structural change (new modules, deps, etc).
 
 ## status
 
-this is the init skeleton commit only. core interception, real gadgets, full tui, replay etc come in follow-on atomic tdd steps.
+v1 is real: interception, 7 gadgets, full tui, headless, config, recording, and the sentinel bridge (`ghost hook` / `ghost install`) verified end-to-end against the real sentinel binary. 63 tests, clippy + fmt clean.
 
 built because the space needed a loud offensive counterpart to the defensive tooling. for science lmao.
 

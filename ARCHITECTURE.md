@@ -2,7 +2,7 @@
 
 **ghost** 👻 cli + tui for live visibility + deliberate chaos injection into real agent tool calls, cli commands, local services. offensive research counterpart to sentinel. "they ALL talk eventually XX"
 
-last updated: 2026-06-14 (full v1 CLI wiring: clap full subcommands attach/proxy/run/replay/gadgets/config + globals --headless/--config; toml serde GhostConfig+VoicePrefs+targets; session select_gadgets + save_recording; main dispatch with dry banners voice everywhere, headless path, replay load+face sim; integration TDD in tests/ + cli/src (voice asserts, dry-run banners, roundtrips, parse); all tests 50+ green, clippy -D/fmt clean; release verified; ARCH/voice per spec)
+last updated: 2026-06-14 (ghost↔sentinel bridge added: src/bridge.rs + `ghost hook`/`ghost install` subcommands. ghost is now a PreToolUse middleware that wraps sentinel — runs offense, defers to sentinel's policy, narrates blocks in voice (varied kaomoji roasts per BlockCategory), grafts the roast into the deny reason the agent sees + logs it to ~/.ghost/blocks.log. never downgrades a deny, never auto-allows, fails closed. verified end-to-end against the real sentinel binary. 63 tests, clippy --all-targets/fmt clean. spec: docs/superpowers/specs/2026-06-14-ghost-sentinel-bridge-design.md)
 
 ## project overview
 
@@ -19,6 +19,7 @@ why: makes watching tool calls entertaining instead of soul-crushing. complement
 | tui            | ratatui + crossterm         | 0.30 / 0.29                      |
 | async          | tokio                       | 1 (full)                         |
 | config         | serde + toml                | 1 + 1.1                          |
+| json (hooks)   | serde_json                  | 1 (PreToolUse wire contract + settings.json merge) |
 | randomness     | rand                        | 0.10                             |
 | errors         | thiserror                   | 2                                |
 | core           | std (instant, etc)          | -                                |
@@ -42,7 +43,8 @@ ghost/
 ├── src/
 │   ├── main.rs          # thin clap dispatch + voice banners
 │   ├── lib.rs           # module root + reexports + skeleton structure test
-│   ├── cli.rs           # clap subcommands (attach, proxy, run, replay, gadgets)
+│   ├── cli.rs           # clap subcommands (attach, proxy, run, replay, gadgets, config, hook, install)
+│   ├── bridge.rs        # ghost↔sentinel PreToolUse bridge: run_bridge (pure, mockable SentinelOracle), SubprocessSentinel, the deny/defer wire contract, BridgeMode (observe/shadow/live), install_into_settings (idempotent settings.json merge). security invariants enforced here.
 │   ├── config.rs        # GhostConfig + VoicePrefs + toml load (serde)
 │   ├── event.rs         # Event enum + PersonalityHint (core data model)
 │   ├── interceptor.rs   # attachment backends (real v1: CommandWrapper using std::process for exec/capture of CommandOutput, ProxyStub). emits pure Events only. banners + dry_run safety. no gadgets/mutation here.
@@ -71,6 +73,7 @@ annotated:
 - **command wrapper (v1 primary)**: std::process::Command exec + capture stdout/stderr to CommandOutput events. always prints + emits "👻 ghost attached (observe only)" banner in voice. dry_run only for banner/observe wording + gadget count (exec of target always happens per attach intent). loud errors on fail ("well that was a silent no-op XX").
 - **basic event bus**: in Session (ingest + attach_with_interceptor). updates distrust_score + ghost_face_state on roasts. no channels yet (vec collect for v1 sync attach).
 - **safety first**: dry-run everywhere in v1. explicit banners on attach. no auto-mutate. resource limits planned.
+- **the bridge (offense+defense loop)**: `ghost hook` is a PreToolUse middleware. flow: stdin tool-call -> ghost offense (observe mode = no payload mutation) -> `sentinel evaluate` subprocess -> on deny, classify (BlockCategory) + produce_block_roast (varied, kaomoji) + graft into the deny reason (agent-facing) + emit block event to ~/.ghost/blocks.log (you-facing) -> re-emit the decision on stdout. wire contract preserved exactly: nested `hookSpecificOutput.deny` to block, empty `{}` to defer. INVARIANTS (in bridge.rs, tested): never downgrade a deny, never fabricate an `allow`, fail CLOSED if sentinel is unreachable, observe never mutates the payload. the bridge core is a pure fn over a mockable `SentinelOracle` so the whole loop is unit-tested without spawning sentinel.
 - **state management**: Session owns the truth for a run (events vec, counters, active gadgets, dry_run flag). no global.
 - **renderer (TUI)**: ratatui widgets custom (face kaomoji from GhostFaceState + intensity, glitch activity on high/party face via spans/invert, bar uses gadget descs+hotkeys in voice, status/livelog from metrics+LogLines), crossterm raw loop + Layout splits per spec (top face 7, main 62/38 activity/gadgets, bottom status+log), overlays (centered popups help/confirm with X voice), keys (q quit, 1-9 gadget, h help, space pause, r roast), resize, App owns Session for consume+activate. headless if !tty || GHOST_HEADLESS (prints events + roasts + face emoji in voice). TDD via Buffer::empty + render asserts on kaomoji/glitch/voice/layout.
 - **cli design**: subcommands + trailing args for attach. clap derive. long_about points at spec.
@@ -104,7 +107,8 @@ none in v1. config via toml file or cli flags only. (future: GHOST_DRY_RUN, GHOS
 
 ## external services and integrations
 
-none. pure local. (future easy: sentinel hook format compat, gstack health hooks. out of v1 scope.)
+- **sentinel** (the bridge): ghost invokes the `sentinel evaluate` binary as a subprocess (stdin tool-call JSON -> stdout decision), exactly the Claude Code PreToolUse contract. `ghost install` writes ghost's hook into `~/.claude/settings.json` (and folds a standalone sentinel hook into the bridge so ghost is the single entrypoint). sentinel is the security authority; ghost is offense + voice on top of it.
+- otherwise pure local. (future: gstack health hooks. out of scope.)
 
 ## gotchas
 
@@ -118,6 +122,10 @@ none. pure local. (future easy: sentinel hook format compat, gstack health hooks
 - **full cli wiring v1**: clap globals --headless (or auto !tty), --config <toml> on all. subcommands: attach/proxy/run/replay/gadgets/config all dispatch to Session + CommandWrapper/ProxyStub (dry passed), TuiRenderer (headless or interactive), select_gadgets, save_recording. Config toml (gadgets/voice/targets) loads and seeds. Replay loads ghost-recording-<id>.txt (voice lines) + face sim prints. All output in exact voice.
 - **recordings**: simple .txt (personality_lines + banners) saved on attach/proxy/run exit to cwd as ghost-recording-*.txt . replay <id|path> replays with kaomoji cycle. basic, no serde on Event (Instant).
 - **TUI + headless/tty**: uses cli.headless || !stdout.is_terminal() for non-ratatui path (prints banners + roasts + events in voice via run_headless + personality). TUI run takes owned Session. clippy/fmt clean. Buffer tests + voice asserts.
+- **bridge: hook stdout is JSON ONLY**: `ghost hook` writes the decision JSON to stdout (claude code parses it) and the voice roast to stderr + ~/.ghost/blocks.log. never print voice to stdout or you corrupt the hook contract.
+- **bridge: the empty-object defer**: sentinel emits `{}` (not `permissionDecision:"allow"`) to defer to claude code's normal prompt. ghost MUST preserve that — emitting `"allow"` would silently auto-approve every non-blocked call. tested in `defer_passes_through_as_empty_object_never_allow`.
+- **bridge: self-FP when testing locally**: feeding attack-pattern strings (`curl ... | sh`, `id_rsa`) on the dev box trips YOUR OWN session's sentinel hook before the demo sentinel runs. use benign trigger tokens + classify-via-reason keywords. (the greedy `curl.*\|.*sh` matches the whole command if it merely contains "curl" + a shell pipe.)
+- **bridge: edition-2024 let-chains**: `if let Some(x) = ... && cond {}` is used (interceptor, main). needs rust 2024.
 
 ## commands
 
@@ -135,6 +143,12 @@ cargo run -- run --config ghost.toml  # batch from targets + gadgets in toml
 cargo run -- replay 1718400000   # loads ghost-recording-*.txt , face cycle + voice lines replay
 cargo run -- replay attach-17184... 
 
+# the bridge (offense+defense)
+cargo run -- install --sentinel /path/to/sentinel   # wire ghost hook into ~/.claude/settings.json (idempotent, wraps sentinel)
+cargo run -- install --uninstall                    # remove the bridge hook
+echo '{"tool_name":"Bash","tool_input":{"command":"ls"}}' | cargo run -- hook --sentinel /path/to/sentinel  # per-call bridge (claude code invokes this)
+# block -> nested deny w/ voice on stdout + roast on stderr + ~/.ghost/blocks.log ; allow -> {}
+
 # test (tdd style, run often)
 cargo test
 cargo test -- --quiet
@@ -143,7 +157,7 @@ cargo test skeleton   # integration: cli, headless voice, replay, config roundtr
 
 # lint + fmt (clean before commit)
 cargo fmt -- --check
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings   # tests included
 
 # release build (the real one)
 cargo build --release

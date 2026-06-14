@@ -7,6 +7,7 @@
 //! See ARCHITECTURE.md and the design spec for boundaries.
 //! Every layer has clear traits so they are independently testable (TDD).
 
+pub mod bridge;
 pub mod cli;
 pub mod config;
 pub mod event;

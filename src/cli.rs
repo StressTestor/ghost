@@ -76,6 +76,33 @@ pub enum Commands {
     /// Replay a previous session recording (text + face states + roasts in voice).
     Replay { session_id: String },
 
+    /// PreToolUse bridge: read a tool-call on stdin, run ghost's offense, defer
+    /// to sentinel's policy, narrate the verdict in voice, emit the decision on
+    /// stdout. this is what claude code invokes per tool call. 👻🛡️
+    /// (invoked by `ghost install`-d settings.json; not usually run by hand)
+    Hook {
+        /// how to invoke the defense core (default: from config or `sentinel`)
+        #[arg(long)]
+        sentinel: Option<String>,
+
+        /// observe | shadow-attack | live-attack (default observe, the safe one)
+        #[arg(long)]
+        mode: Option<String>,
+    },
+
+    /// Wire the ghost↔sentinel bridge into ~/.claude/settings.json as the
+    /// PreToolUse hook. idempotent, non-clobbering. folds a standalone sentinel
+    /// hook into the bridge so ghost is the single loud entrypoint.
+    Install {
+        /// path/cmd for sentinel (default: `which sentinel`, else "sentinel")
+        #[arg(long)]
+        sentinel: Option<String>,
+
+        /// undo: remove the ghost bridge hook from settings.json
+        #[arg(long, default_value_t = false)]
+        uninstall: bool,
+    },
+
     /// List available gadgets with your voice descriptions + hotkeys.
     Gadgets,
 

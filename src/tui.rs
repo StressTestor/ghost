@@ -647,7 +647,7 @@ mod tests {
         let rendered: String = buf
             .content
             .iter()
-            .map(|c| c.symbol().clone())
+            .map(|c| c.symbol())
             .collect::<Vec<_>>()
             .join("");
         assert!(

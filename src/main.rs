@@ -189,6 +189,94 @@ fn main() {
             println!("replay done. zero chill 💀");
         }
 
+        Commands::Hook { sentinel, mode } => {
+            // the PreToolUse bridge. read the tool call, run offense, defer to
+            // sentinel, narrate the verdict. claude code reads our STDOUT as the
+            // decision; the voice goes to stderr + the watch log (never stdout).
+            use ghost::bridge::{BridgeConfig, BridgeMode, SubprocessSentinel, run_bridge};
+            use std::io::Read;
+
+            let mut input = String::new();
+            let _ = std::io::stdin().read_to_string(&mut input);
+
+            let sentinel_cmd = sentinel.unwrap_or_else(|| "sentinel".to_string());
+            let oracle = SubprocessSentinel::new(sentinel_cmd, vec!["evaluate".to_string()]);
+
+            let mut cfg = BridgeConfig::default();
+            if let Some(m) = mode.as_deref() {
+                cfg.mode = match m {
+                    "shadow-attack" => BridgeMode::ShadowAttack,
+                    "live-attack" => BridgeMode::LiveAttack,
+                    _ => BridgeMode::Observe,
+                };
+            }
+
+            let engine = ghost::PersonalityEngine::new();
+            let outcome = run_bridge(&input, &engine, &oracle, &cfg);
+
+            if let Some(ev) = &outcome.block_event {
+                // narrate to you: the watch log + stderr (claude surfaces hook stderr)
+                let line = format!("👻 {} {}", outcome.face.emoji(), ev);
+                append_block_log(&line);
+                eprintln!("{line}");
+            }
+
+            // the decision claude code actually enforces. stdout = JSON only.
+            println!("{}", outcome.hook_stdout);
+        }
+
+        Commands::Install {
+            sentinel,
+            uninstall,
+        } => {
+            use ghost::bridge::{install_into_settings, uninstall_from_settings};
+
+            let settings_path = claude_settings_path();
+            let current = std::fs::read_to_string(&settings_path).unwrap_or_default();
+
+            if uninstall {
+                match uninstall_from_settings(&current) {
+                    Ok(updated) => {
+                        let _ = write_settings(&settings_path, &updated);
+                        println!(
+                            "👻 ghost bridge yanked from {}. back to whatever defense you had, lone wolf >:[ XX",
+                            settings_path
+                        );
+                    }
+                    Err(e) => eprintln!("couldn't uninstall, settings.json is cursed: {e} >:[ 💀"),
+                }
+            } else {
+                let ghost_bin = std::env::current_exe()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "ghost".to_string());
+                let sentinel_cmd = sentinel
+                    .or_else(which_sentinel)
+                    .unwrap_or_else(|| "sentinel".to_string());
+
+                match install_into_settings(&current, &ghost_bin, &sentinel_cmd) {
+                    Ok(updated) => match write_settings(&settings_path, &updated) {
+                        Ok(()) => {
+                            println!("👻 ghost bridge installed into {} (¬‿¬)", settings_path);
+                            println!(
+                                "  ghost now wraps sentinel ({}) on every tool call.",
+                                sentinel_cmd
+                            );
+                            println!(
+                                "  offense runs, sentinel rules, ghost roasts the blocks in your voice."
+                            );
+                            println!(
+                                "  blocks land in ~/.ghost/blocks.log. they ALL talk eventually XX 💀"
+                            );
+                        }
+                        Err(e) => eprintln!(">:[ wrote nothing, fix your perms: {e} 💀"),
+                    },
+                    Err(e) => {
+                        eprintln!(">:[ install failed: {e}. is your settings.json valid json? 💀")
+                    }
+                }
+            }
+        }
+
         Commands::Gadgets => {
             println!("👻 available gadgets (v1). slot these. hotkeys coming.");
             println!("------------------------------------------------");
@@ -223,4 +311,49 @@ fn main() {
             );
         }
     }
+}
+
+/// append a block narration line to the watch log (~/.ghost/blocks.log).
+/// the side channel a live `ghost watch` would tail. best-effort, never panics.
+fn append_block_log(line: &str) {
+    use std::io::Write;
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    let dir = std::path::Path::new(&home).join(".ghost");
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("blocks.log"))
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// ~/.claude/settings.json (where claude code reads PreToolUse hooks).
+fn claude_settings_path() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    format!("{home}/.claude/settings.json")
+}
+
+/// write settings.json, creating parent dirs. pretty json (it's user-editable).
+fn write_settings(path: &str, contents: &str) -> std::io::Result<()> {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, contents)
+}
+
+/// best-effort `which sentinel` so install can self-configure.
+fn which_sentinel() -> Option<String> {
+    let out = std::process::Command::new("which")
+        .arg("sentinel")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if path.is_empty() { None } else { Some(path) }
 }
