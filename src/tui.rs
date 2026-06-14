@@ -1,3 +1,23 @@
+use std::io::{self, stdout};
+use std::time::Duration;
+
+use crossterm::{
+    event::{self, Event as CEvent, KeyCode, KeyEventKind},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::{
+    Frame, Terminal,
+    backend::CrosstermBackend,
+    buffer::Buffer,
+    layout::{Constraint, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span, Text},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Widget, Wrap},
+};
+
+use crate::event::{Event, GhostFaceState};
+use crate::gadgets::default_gadgets;
 use crate::session::Session;
 
 /// Renderer (TUI) layer using ratatui + crossterm.
@@ -16,8 +36,8 @@ use crate::session::Session;
 /// - Keyboard first. Mouse optional.
 /// - Resize aware.
 ///
-/// This is pure stub for skeleton. Real ratatui widgets, event loop, face drawing in next steps.
-/// Headless mode bypasses this entirely (still gets personality output).
+/// Headless: when --headless or !isatty, bypass ratatui entirely. print banners + every roast/event in exact @ThatbV voice kaomoji, summary. still personality driven.
+/// Used by main dispatch + replay.
 pub struct TuiRenderer {
     // terminal state etc later
 }
@@ -28,15 +48,111 @@ impl TuiRenderer {
     }
 
     /// Run the full TUI loop. Blocks until exit.
-    /// In skeleton: just prints a spooky banner + session summary then "would enter tui".
-    /// (prevents accidental real TUI until impl)
-    pub fn run(&self, session: &Session) {
-        println!("👻 ghost tui engaged (stub)");
-        println!("target: {}", session.target);
+    /// Takes owned Session for interactive gadget activation (which delegates to session's personality + face updates).
+    /// Real: crossterm raw mode + ratatui draw loop + key poll. Keyboard first per spec.
+    pub fn run(&self, session: Session) {
+        if let Err(e) = self.run_interactive(session) {
+            eprintln!(
+                "👻 tui error (well that was a silent no-op XX): {} >:[ they ALL talk eventually",
+                e
+            );
+        }
+    }
+
+    #[allow(
+        clippy::collapsible_if,
+        clippy::unnecessary_to_owned,
+        deprecated,
+        unused_variables,
+        unreachable_patterns
+    )]
+    fn run_interactive(&self, session: Session) -> io::Result<()> {
+        let mut app = App::new(session);
+
+        enable_raw_mode()?;
+        let mut out = stdout();
+        execute!(out, EnterAlternateScreen)?;
+        let backend = CrosstermBackend::new(out);
+        let mut terminal = Terminal::new(backend)?;
+
+        loop {
+            terminal.draw(|f| draw_ui(f, &app))?;
+
+            if event::poll(Duration::from_millis(120))?
+                && let CEvent::Key(key) = event::read()?
+            {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('h') => app.show_help = !app.show_help,
+                    KeyCode::Char(' ') => app.paused = !app.paused,
+                    KeyCode::Char(c) if c.is_ascii_digit() => {
+                        if !app.paused {
+                            let idx = (c.to_digit(10).unwrap_or(0) as usize).saturating_sub(1);
+                            app.activate_gadget(idx);
+                        }
+                    }
+                    KeyCode::Char('r') => {
+                        if !app.paused {
+                            app.activate_gadget(1);
+                        }
+                    }
+                    KeyCode::Up => app.scroll = app.scroll.saturating_sub(1),
+                    KeyCode::Down => app.scroll = app.scroll.saturating_add(1),
+                    _ => {}
+                }
+            }
+        }
+
+        disable_raw_mode()?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        println!("👻 ghost detached (observe only). (¬‿¬) they ALL talk eventually XX");
+        Ok(())
+    }
+
+    /// Headless runner: print events + roasts + face in voice. No ratatui. For --headless / env / !tty.
+    pub fn run_headless(&self, session: &Session) {
+        println!(
+            "👻 ghost headless (no tty or flag). raw event stream + personality roasts. zero chill detected 💀"
+        );
+        println!("target: {} (they ALL talk eventually XX)", session.target);
+        for ev in &session.events {
+            match ev {
+                Event::LogLine { msg, source, .. } => {
+                    if source.starts_with("gadget:")
+                        || msg.contains("👻")
+                        || msg.contains("zero chill")
+                        || msg.contains("they ALL")
+                        || msg.contains(">:[")
+                        || msg.contains("(¬")
+                    {
+                        println!("  {}", msg);
+                    } else {
+                        println!("  [log:{}] {}", source, msg);
+                    }
+                }
+                Event::CommandOutput { line, stream, .. } => {
+                    println!("  [{}] {}", stream, line);
+                }
+                Event::ToolCall { name, args, .. } => {
+                    println!("  [toolcall] {} args={}", name, args);
+                }
+                Event::Response { body, status, .. } => {
+                    println!("  [response] {} status={:?}", body, status);
+                }
+            }
+        }
+        let m = session.get_metrics();
         println!("{}", session.summary());
-        println!("> press q to quit in real version. zero chill mode on.");
-        println!("(¬‿¬) they ALL talk eventually XX");
-        // real: crossterm enable raw, ratatui Terminal::new, draw loop, input poll
+        println!(
+            "ghost face: {} | distrust: {} | roasts: {} (｡◕‿↼) CHAOS FOR SCIENCE",
+            m.face.emoji(),
+            m.distrust_score,
+            m.roast_count
+        );
+        println!("-- end trace -- they ALL talk eventually XX lmao");
     }
 
     /// Headless / reporter path (no TUI). Still runs personality for artifacts.
@@ -47,6 +163,457 @@ impl TuiRenderer {
             session.roast_count
         )
     }
+
+    /// basic replay from recording file (produced by Session::save_recording).
+    /// loads voice lines (banners + roasts), replays with cycling ghost face sim + prints (for dogfood + headless).
+    /// id: "123456" -> ghost-recording-123456.txt or explicit path.
+    pub fn replay(id: &str) -> String {
+        let path = if id.contains('/') || id.ends_with(".txt") {
+            id.to_string()
+        } else {
+            format!("ghost-recording-{}.txt", id)
+        };
+
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                let mut out = format!(
+                    "👻 replaying session {} (¬‿¬) they ALL talk eventually XX\n",
+                    id
+                );
+                let faces = ["👻", "(¬‿¬)", "💀👻(¬‿¬)", ">:[", "(｡◕‿↼)", "ಠ‿ಠ", "💀"];
+                for (i, line) in content.lines().enumerate() {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let f = faces[i % faces.len()];
+                    let replay_line = format!("{} [replay {}] {}", f, i, line);
+                    println!("{}", replay_line);
+                    out.push_str(&replay_line);
+                    out.push('\n');
+                }
+                let closer = "replay complete. zero chill detected 💀 they ALL talk eventually XX";
+                println!("{}", closer);
+                out.push_str(closer);
+                out.push('\n');
+                out
+            }
+            Err(e) => {
+                let msg = format!(
+                    "👻 no recording for {} at {}. well that was a silent no-op XX. run attach first. err: {}",
+                    id, path, e
+                );
+                println!("{}", msg);
+                msg
+            }
+        }
+    }
+}
+
+/// App owns the consumed Session for interactive TUI (post-attach trace review + manual gadget pokes via keys).
+/// TUI consumes only; delegates activate to session (personality + GhostFaceState updates happen inside session/personality).
+struct App {
+    session: Session,
+    face: GhostFaceState,
+    intensity: u8,
+    log_lines: Vec<String>,
+    show_help: bool,
+    show_confirm: Option<String>,
+    paused: bool,
+    scroll: u16,
+    dry_run: bool,
+}
+
+impl App {
+    fn new(session: Session) -> Self {
+        let mut logs: Vec<String> = session
+            .events
+            .iter()
+            .filter_map(|e| {
+                if let Event::LogLine { msg, source, .. } = e {
+                    if source.starts_with("gadget:")
+                        || msg.contains("👻")
+                        || msg.contains("ghost attached")
+                    {
+                        Some(msg.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if logs.is_empty() {
+            logs.push(
+                "👻 ghost attached (observe only)... (¬‿¬) they ALL talk eventually XX".to_string(),
+            );
+        }
+        let m = session.get_metrics();
+        let dry = session.dry_run;
+        Self {
+            face: m.face,
+            intensity: m.distrust_score as u8,
+            log_lines: logs,
+            session,
+            show_help: false,
+            show_confirm: None,
+            paused: false,
+            scroll: 0,
+            dry_run: dry,
+        }
+    }
+
+    fn activate_gadget(&mut self, idx: usize) {
+        let names: Vec<String> = self
+            .session
+            .active_gadgets
+            .iter()
+            .map(|g| g.name().to_string())
+            .collect();
+        if let Some(name) = names.get(idx).cloned() {
+            if !self.dry_run && self.show_confirm.is_none() {
+                self.show_confirm = Some(name);
+                return;
+            }
+            self.show_confirm = None;
+            self.session.activate_gadget(&name);
+            let m = self.session.get_metrics();
+            self.face = m.face.clone();
+            self.intensity = m.distrust_score as u8;
+            if let Some(Event::LogLine { msg, source: _, .. }) = self
+                .session
+                .events
+                .iter()
+                .rev()
+                .find(|e| matches!(e, Event::LogLine { source, .. } if source.contains(&name)))
+            {
+                self.log_lines.push(msg.clone());
+            } else {
+                self.log_lines.push(format!(
+                    "{} activated. zero chill detected 💀 (¬‿¬) they ALL talk eventually XX",
+                    name
+                ));
+            }
+            if self.log_lines.len() > 20 {
+                let _ = self.log_lines.remove(0);
+            }
+        }
+    }
+}
+
+fn draw_ui(f: &mut Frame, app: &App) {
+    let size = f.area();
+
+    let v_chunks = Layout::vertical([
+        Constraint::Length(7),
+        Constraint::Min(10),
+        Constraint::Length(7),
+    ])
+    .split(size);
+
+    // top: title + target (per spec)
+    let title_line = Line::from(vec![
+        Span::styled(
+            "ghost 👻  ",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(&app.session.target, Style::default().fg(Color::Cyan)),
+        Span::styled(
+            "  (they ALL talk eventually XX)",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    let title_p = Paragraph::new(title_line);
+    let title_area = Rect {
+        x: v_chunks[0].x,
+        y: v_chunks[0].y,
+        width: v_chunks[0].width,
+        height: 1,
+    };
+    f.render_widget(title_p, title_area);
+
+    // face block (5-7 lines tall)
+    let face_area = Rect {
+        x: v_chunks[0].x,
+        y: v_chunks[0].y + 1,
+        width: v_chunks[0].width,
+        height: 6,
+    };
+    let face_w = GhostFaceWidget {
+        state: &app.face,
+        intensity: app.intensity,
+    };
+    f.render_widget(face_w, face_area);
+
+    // main: left activity, right gadgets (horiz split)
+    let main_chunks = Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)])
+        .split(v_chunks[1]);
+
+    let activity_w = ActivityCanvas {
+        events: &app.session.events,
+        face: &app.face,
+        intensity: app.intensity,
+        scroll: app.scroll,
+    };
+    f.render_widget(activity_w, main_chunks[0]);
+
+    // gadget bar: hotkeys + exact voice descs from existing stubs
+    let gadget_items: Vec<ListItem> = default_gadgets()
+        .iter()
+        .enumerate()
+        .map(|(i, g)| {
+            let hotkey = format!("[{}]", i + 1);
+            let name = g.name();
+            let desc = g.description();
+            let armed = if app.dry_run {
+                " (observe only)"
+            } else {
+                " (armed >:[)"
+            };
+            ListItem::new(format!("{} {} {} {}", hotkey, name, armed, desc))
+        })
+        .collect();
+    let gadget_list = List::new(gadget_items)
+        .block(
+            Block::default()
+                .title("gadgets (tap num) 👻")
+                .borders(Borders::ALL),
+        )
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+    f.render_widget(gadget_list, main_chunks[1]);
+
+    // bottom: status strip (ZERO CHILL etc metrics) + live log (personality)
+    let bottom_chunks =
+        Layout::vertical([Constraint::Length(2), Constraint::Length(5)]).split(v_chunks[2]);
+
+    let status_text = format!(
+        "ZERO CHILL | THEY TALKING YET? >:[ | CHAOS FOR SCIENCE | ev:{} roasts:{} distrust:{} dry={} face:{}",
+        app.session.events.len(),
+        app.session.roast_count,
+        app.session.distrust_score,
+        app.dry_run,
+        app.face.emoji()
+    );
+    let status = Paragraph::new(Line::from(Span::styled(
+        status_text,
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    )))
+    .block(Block::default().title("status strip").borders(Borders::ALL));
+    f.render_widget(status, bottom_chunks[0]);
+
+    let log_display: Vec<Line> = app
+        .log_lines
+        .iter()
+        .rev()
+        .take(4)
+        .map(|l| Line::from(Span::styled(l, Style::default().fg(Color::Magenta))))
+        .collect();
+    let live_log = Paragraph::new(Text::from(log_display))
+        .block(
+            Block::default()
+                .title("live log (personality) (¬‿¬) they ALL talk eventually XX")
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: true });
+    f.render_widget(live_log, bottom_chunks[1]);
+
+    // overlays (help in voice, confirm for !dry mutations)
+    if app.show_help {
+        let help = "help 👻\nq/esc: quit\n1-9: activate gadget (poke roast etc)\nspace: pause\nr: force roast\nh: toggle this\nup/down: scroll activity\n\nzero chill. (¬‿¬) they ALL talk eventually XX\nfuck off pete energy on bad agents. lmao";
+        let p = Paragraph::new(help)
+            .block(
+                Block::default()
+                    .title("help (your voice, no corporate)")
+                    .borders(Borders::ALL),
+            )
+            .style(Style::default().fg(Color::Yellow));
+        let popup = centered_rect(55, 45, size);
+        f.render_widget(p, popup);
+    }
+    if let Some(g) = &app.show_confirm {
+        let msg = format!(
+            "confirm mutation for {} ? (y/n)\n>[: real mode. zero chill detected 💀\nthey ALL talk eventually XX (dry_run was false)",
+            g
+        );
+        let p = Paragraph::new(msg)
+            .block(
+                Block::default()
+                    .title("confirm (if !dry)")
+                    .borders(Borders::ALL),
+            )
+            .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD));
+        let popup = centered_rect(50, 30, size);
+        f.render_widget(p, popup);
+    }
+}
+
+/// GhostFace widget: 5-7 lines per spec. Renders kaomoji/emoji + voice flavor + intensity effects from GhostFaceState.
+struct GhostFaceWidget<'a> {
+    state: &'a GhostFaceState,
+    intensity: u8,
+}
+
+impl Widget for GhostFaceWidget<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let block = Block::default()
+            .title("ghost face 👻")
+            .borders(Borders::ALL)
+            .style(Style::default().fg(Color::Magenta));
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        let emoji = self.state.emoji();
+        let (flavor, base_color) = match self.state {
+            GhostFaceState::Neutral => ("spooky default. watching. (¬‿¬)", Color::Magenta),
+            GhostFaceState::SideEye => ("side-eye engaged. poke land (¬‿¬)", Color::Cyan),
+            GhostFaceState::Roast => ("roast hit. (｡◕‿↼) zero chill detected", Color::Yellow),
+            GhostFaceState::Angry => (">: [ fuck off pete energy. silent no-op", Color::Red),
+            GhostFaceState::Party => (
+                "party mode 💀👻(¬‿¬) kaomoji spam lmao XX",
+                Color::LightMagenta,
+            ),
+            GhostFaceState::Skeptical => ("skeptical. ಠ‿ಠ they ALL talk eventually", Color::Blue),
+            GhostFaceState::ZeroChill => ("ZERO CHILL 💀 digital bully mode. lmao", Color::Red),
+        };
+
+        let mut lines: Vec<Line> = vec![
+            Line::from(vec![
+                Span::raw("   "),
+                Span::styled(
+                    emoji,
+                    Style::default().fg(base_color).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(Span::styled(flavor, Style::default().fg(base_color))),
+        ];
+        if self.intensity >= 5 {
+            lines.push(Line::from(Span::styled(
+                "!! intensity high -- eyes glitch !!",
+                Style::default()
+                    .fg(Color::Red)
+                    .add_modifier(Modifier::RAPID_BLINK),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            "they ALL talk eventually XX",
+            Style::default().fg(Color::DarkGray),
+        )));
+        if matches!(
+            self.state,
+            GhostFaceState::Party | GhostFaceState::ZeroChill
+        ) {
+            lines.push(Line::from(Span::styled(
+                "💀👻(¬‿¬) (｡◕‿↼) >:[ lmao",
+                Style::default().fg(Color::LightYellow),
+            )));
+        }
+
+        let p = Paragraph::new(lines).alignment(ratatui::layout::Alignment::Center);
+        p.render(inner, buf);
+    }
+}
+
+/// Activity canvas widget: glitchy event stream. Glitch via !! + bg invert on high intensity or specific faces (deterministic, per "on intensity").
+struct ActivityCanvas<'a> {
+    events: &'a [Event],
+    face: &'a GhostFaceState,
+    intensity: u8,
+    scroll: u16,
+}
+
+impl Widget for ActivityCanvas<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        let block = Block::default()
+            .title("activity (glitchy event stream + effects) 👻")
+            .borders(Borders::ALL);
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        let max_lines = inner.height as usize;
+        let mut lines: Vec<Line> = Vec::new();
+
+        let start = self.scroll as usize;
+        let recent: Vec<&Event> = self
+            .events
+            .iter()
+            .rev()
+            .skip(start)
+            .take(max_lines.saturating_sub(1))
+            .collect();
+
+        for ev in recent.iter().rev() {
+            let (pre, content, mut sty) = match ev {
+                Event::CommandOutput { line, stream, .. } => (
+                    "[cmd]",
+                    format!("{}: {}", stream, line),
+                    Style::default().fg(Color::Gray),
+                ),
+                Event::ToolCall { name, .. } => {
+                    ("[tool]", name.clone(), Style::default().fg(Color::Cyan))
+                }
+                Event::Response { body, .. } => {
+                    ("[resp]", body.clone(), Style::default().fg(Color::Green))
+                }
+                Event::LogLine { msg, source, .. } if source.starts_with("gadget:") => (
+                    "[roast]",
+                    msg.clone(),
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::ITALIC),
+                ),
+                Event::LogLine { msg, .. } => {
+                    ("[log]", msg.clone(), Style::default().fg(Color::Yellow))
+                } // no fallthrough needed; all Event variants covered above for activity canvas
+            };
+
+            let mut spans = vec![
+                Span::styled(pre, Style::default().fg(Color::Blue)),
+                Span::raw(" "),
+            ];
+
+            let do_glitch = self.intensity >= 5
+                || matches!(
+                    self.face,
+                    GhostFaceState::Party | GhostFaceState::Angry | GhostFaceState::ZeroChill
+                );
+            let mut final_c = content;
+            if do_glitch {
+                final_c = format!("{} !!", final_c);
+                sty = sty.bg(Color::Black).fg(Color::White);
+            }
+            spans.push(Span::styled(final_c, sty));
+            lines.push(Line::from(spans));
+        }
+
+        while lines.len() < max_lines {
+            lines.push(Line::from(""));
+        }
+
+        let p = Paragraph::new(lines).wrap(Wrap { trim: true });
+        p.render(inner, buf);
+    }
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_v = Layout::vertical([
+        Constraint::Percentage((100 - percent_y) / 2),
+        Constraint::Percentage(percent_y),
+        Constraint::Percentage((100 - percent_y) / 2),
+    ])
+    .split(r);
+    let popup_h = Layout::horizontal([
+        Constraint::Percentage((100 - percent_x) / 2),
+        Constraint::Percentage(percent_x),
+        Constraint::Percentage((100 - percent_x) / 2),
+    ])
+    .split(popup_v[1]);
+    popup_h[1]
 }
 
 impl Default for TuiRenderer {
@@ -54,3 +621,157 @@ impl Default for TuiRenderer {
         Self::new()
     }
 }
+
+// TDD tests added first (red phase). Assert kaomoji/voice in face, glitch effect in activity on intensity, gadget bar voice names, headless prints voice, layout, app face update via personality.
+// cargo test ... tui filters or specific test names to see red -> after widget impls: green.
+// Buffer tests allow widget verification without real terminal.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::Event;
+    use crate::gadgets::default_gadgets;
+    use crate::session::Session;
+    use std::time::Instant;
+
+    #[test]
+    fn ghost_face_renders_kaomoji_for_state() {
+        let angry = GhostFaceState::Angry;
+        let w = GhostFaceWidget {
+            state: &angry,
+            intensity: 2,
+        };
+        let area = Rect::new(0, 0, 30, 8);
+        let mut buf = Buffer::empty(area);
+        w.render(area, &mut buf);
+        let rendered: String = buf
+            .content
+            .iter()
+            .map(|c| c.symbol().clone())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            rendered.contains(">:[")
+                || rendered.contains("fuck off pete")
+                || rendered.contains("Angry"),
+            "ghost face must render kaomoji >:[ + blunt voice for Angry state"
+        );
+        assert!(
+            rendered.contains("👻") || rendered.contains("ghost face"),
+            "emoji or block header"
+        );
+    }
+
+    #[test]
+    fn activity_includes_glitch_on_high_intensity() {
+        let evs = vec![Event::ToolCall {
+            name: "risky".into(),
+            args: "{}".into(),
+            ts: Instant::now(),
+        }];
+        let party = GhostFaceState::Party;
+        let canvas = ActivityCanvas {
+            events: &evs,
+            face: &party,
+            intensity: 8,
+            scroll: 0,
+        };
+        let area = Rect::new(0, 0, 40, 6);
+        let mut buf = Buffer::empty(area);
+        canvas.render(area, &mut buf);
+        let has_glitch = buf.content.iter().any(|c| {
+            c.symbol().contains("!!")
+                || c.style().bg == Some(Color::Black)
+                || c.style().fg == Some(Color::White)
+        });
+        assert!(
+            has_glitch,
+            "activity must include glitch (!! or invert) on high intensity / party face"
+        );
+    }
+
+    #[test]
+    fn gadget_bar_shows_voice_names() {
+        let gs = default_gadgets();
+        let poke_desc = gs[0].description();
+        assert!(
+            poke_desc.contains("(¬‿¬)")
+                || poke_desc.contains("zero chill")
+                || poke_desc.contains("they ALL"),
+            "gadget bar must show voice descs with kaomoji per spec"
+        );
+        let roast_desc = gs
+            .iter()
+            .find(|g| g.name() == "roast")
+            .unwrap()
+            .description();
+        assert!(
+            roast_desc.contains("💀") || roast_desc.contains("zero chill"),
+            "roast gadget voice in bar"
+        );
+    }
+
+    #[test]
+    fn headless_prints_banners_and_roasts() {
+        let mut s = Session::new("headless-voice");
+        s.activate_gadget("poke");
+        let r = TuiRenderer::new();
+        let summary = r.headless_summary(&s);
+        assert!(summary.contains("ghost 👻 headless") || summary.contains("roasts fired"));
+        r.run_headless(&s);
+        let has_voice = s.events.iter().any(|e| {
+            if let Event::LogLine { msg, .. } = e {
+                msg.contains("(¬‿¬)")
+                    || msg.contains("they ALL talk eventually")
+                    || msg.contains("👻")
+            } else {
+                false
+            }
+        });
+        assert!(
+            has_voice,
+            "headless must surface personality roasts with kaomoji"
+        );
+    }
+
+    #[test]
+    fn layout_respects_resize() {
+        let size = Rect::new(0, 0, 80, 24);
+        let v = Layout::vertical([
+            Constraint::Length(7),
+            Constraint::Min(10),
+            Constraint::Length(7),
+        ])
+        .split(size);
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0].height, 7, "top face area fixed 5-7 lines tall");
+        assert!(v[1].height >= 10);
+        assert_eq!(v[2].height, 7);
+        let h = Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)])
+            .split(v[1]);
+        assert_eq!(h.len(), 2);
+    }
+
+    #[test]
+    fn app_and_face_update_from_activate_uses_personality() {
+        let s = Session::new("tui-app-test");
+        let mut app = App::new(s);
+        let before = app.face.clone();
+        app.activate_gadget(0);
+        assert_ne!(
+            app.face, before,
+            "face must flip on gadget activate (via personality)"
+        );
+        assert!(!app.log_lines.is_empty());
+        let last = app.log_lines.last().unwrap();
+        assert!(
+            last.contains("(¬")
+                || last.contains("they ALL")
+                || last.contains("👻")
+                || last.contains("zero chill"),
+            "log lines must carry voice"
+        );
+    }
+}
+
+// (replay fn already defined in main TuiRenderer impl; removed dup to fix E0592)

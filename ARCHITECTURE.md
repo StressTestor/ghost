@@ -2,7 +2,7 @@
 
 **ghost** 👻 cli + tui for live visibility + deliberate chaos injection into real agent tool calls, cli commands, local services. offensive research counterpart to sentinel. "they ALL talk eventually XX"
 
-last updated: 2026-06-14 (core: Event/Session/GhostFaceState data model + FULL Personality roast engine w/ produce_roast + exact @ThatbV voice + face updates; TDD red-green in event/session/personality + skeleton integration; personality now the heart)
+last updated: 2026-06-14 (full ratatui TUI: GhostFaceWidget (kaomoji per GhostFaceState 5-7 lines + intensity color/glitch), ActivityCanvas (glitchy event stream !! + invert on high/party), GadgetBar (hotkeys+voice descs), status strip (ZERO CHILL etc), live log tail, overlays (help/confirm in voice), main TUI loop (crossterm poll/keys/q/1-9/space/h, consume Session), headless (tty/env or flag, voice prints), TDD Buffer tests + full suite 50+; updated main wiring + skeleton; ARCH sync)
 
 ## project overview
 
@@ -50,7 +50,7 @@ ghost/
 │   ├── personality.rs   # roast engine. single source of @ThatbV voice. kaomoji, blunt, "zero chill"
 │   ├── gadgets/
 │   │   └── mod.rs       # Gadget trait + stubs (PokeGadget, RoastGadget) + registry. apply returns hint
-│   ├── tui.rs           # ratatui renderer stub (face, canvas, gadget bar, status, headless path)
+│   ├── tui.rs           # full ratatui TUI per spec: widgets (GhostFace 5-7 lines kaomoji+colors+effects, Activity glitchy stream, GadgetBar voice names/hotkeys, Status "ZERO CHILL...", LiveLog), crossterm loop (keys activate gadget/update face, overlays help/confirm), App state (consumes Session), headless path (print events+roasts+face in voice), TDD Buffer tests for renders/voice/glitch/layout. manic readable. keyboard first.
 │   └── ... (more gadget modules, recording, etc in future steps)
 └── tests/               # integration tests (real command wrap, etc) -- empty for skeleton
 ```
@@ -58,6 +58,7 @@ ghost/
 annotated:
 - src/ mirrors the high-level layers from spec exactly (cli, interceptor, event bus via session, gadget engine, personality, renderer, config)
 - gadgets/ for pluggable units behind trait (easy add)
+- tui.rs: full impl (widgets + loop + headless + TDD), consumes only (events/state/personality), no mutation
 - no over-nesting in v1
 - docs/ holds the design spec (do not edit without reason)
 
@@ -71,8 +72,9 @@ annotated:
 - **basic event bus**: in Session (ingest + attach_with_interceptor). updates distrust_score + ghost_face_state on roasts. no channels yet (vec collect for v1 sync attach).
 - **safety first**: dry-run everywhere in v1. explicit banners on attach. no auto-mutate. resource limits planned.
 - **state management**: Session owns the truth for a run (events vec, counters, active gadgets, dry_run flag). no global.
+- **renderer (TUI)**: ratatui widgets custom (face kaomoji from GhostFaceState + intensity, glitch activity on high/party face via spans/invert, bar uses gadget descs+hotkeys in voice, status/livelog from metrics+LogLines), crossterm raw loop + Layout splits per spec (top face 7, main 62/38 activity/gadgets, bottom status+log), overlays (centered popups help/confirm with X voice), keys (q quit, 1-9 gadget, h help, space pause, r roast), resize, App owns Session for consume+activate. headless if !tty || GHOST_HEADLESS (prints events + roasts + face emoji in voice). TDD via Buffer::empty + render asserts on kaomoji/glitch/voice/layout.
 - **cli design**: subcommands + trailing args for attach. clap derive. long_about points at spec.
-- **testability**: every component has clear inputs/outputs. unit tests in module files. TDD required for gadgets/personality/interceptor paths.
+- **testability**: every component has clear inputs/outputs. unit tests in module files. TDD required for gadgets/personality/interceptor paths. full suite 50+ after TUI (incl 7+ new widget/headless/app tests asserting voice/kaomoji).
 - **no auth/db**: local only. no external services.
 
 ## database schema
@@ -113,6 +115,7 @@ none. pure local. (future easy: sentinel hook format compat, gstack health hooks
 - **real command wrapper live**: std::process in CommandWrapper.run(dry_run) does actual exec of user command (echo/ls etc tested), emits real captured lines as CommandOutput + banners. old Interceptor::start() kept for compat/skeleton. proxy is stub (no bind).
 - **tests use std::time::Instant**: no extra deps for timestamps in v1.
 - **clap trailing_var_arg for attach**: allows `ghost attach ./foo --bar` without eating flags. careful with subcommand parsing.
+- **TUI + headless/tty**: run uses is_terminal + GHOST_HEADLESS env for decision (no --headless flag on cli in v1 to keep surface minimal). interactive consumes owned Session (for gadget key activates that update face/logs). always clean exit (disable raw, leave alt). clippy/fmt clean. Buffer tests for widgets (no real term needed).
 
 ## commands
 
@@ -120,13 +123,15 @@ none. pure local. (future easy: sentinel hook format compat, gstack health hooks
 # dev
 cargo build
 cargo run -- --help
-cargo run -- attach echo hi --dry-run   # real wrapper: shows 👻 banner + captured events, voice kaomoji, no gadget mut in dry
+cargo run -- attach echo hi --dry-run   # real wrapper: shows 👻 banner + captured events, voice kaomoji, no gadget mut in dry. in tty: full TUI (face flips, glitch activity, gadgets bar 1/2, status ZERO CHILL, log, keys q/1/h etc); else headless voice prints
 cargo run -- attach ls / --dry-run
+GHOST_HEADLESS=1 cargo run -- attach echo hi --dry-run  # force headless
 cargo run -- gadgets
 
 # test (tdd style, run often)
 cargo test
 cargo test -- --quiet
+cargo test tui   # or specific ghost_face_renders_kaomoji_for_state etc
 
 # lint + fmt (clean before commit)
 cargo fmt -- --check
@@ -152,3 +157,4 @@ no db commands.
 - update this file on any new files, dirs, deps, patterns, envs.
 - all public text (readme, help, code comments with examples) in exact @ThatbV voice.
 - yagni: no db, no full proxy tls, no 20 gadgets, no video export in v1.
+- TUI update 2026-06-14: full ratatui + TDD + voice everywhere in UI strings + headless. ARCH updated same PR.

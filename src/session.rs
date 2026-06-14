@@ -18,6 +18,8 @@ pub struct Session {
     // basic event bus + state per spec (distrust + face for TUI/react)
     pub distrust_score: usize,
     pub ghost_face_state: GhostFaceState,
+    /// collected personality roasts + attached banners for replay / headless print. voice baked.
+    pub personality_lines: Vec<String>,
 }
 
 impl Session {
@@ -32,6 +34,7 @@ impl Session {
             dry_run: true, // always start safe
             distrust_score: 0,
             ghost_face_state: GhostFaceState::Neutral,
+            personality_lines: Vec::new(),
         }
     }
 
@@ -40,7 +43,7 @@ impl Session {
     /// Also updates basic bus state: distrust_score + ghost_face_state on activity (for personality/react).
     pub fn ingest(&mut self, mut event: Event) {
         for gadget in &self.active_gadgets {
-            if let Some(hint) = gadget.apply(&mut event) {
+            if let Some(hint) = gadget.apply(&mut event, self.dry_run) {
                 let line = self.personality.from_hint(&hint, &event);
                 // in real TUI: push to live log + face update
                 // for skeleton: just count + stash a synthetic log event? keep simple.
@@ -52,10 +55,11 @@ impl Session {
                 }
                 // emit side log line for demo (personality baked)
                 self.events.push(Event::LogLine {
-                    msg: line,
+                    msg: line.clone(),
                     source: format!("gadget:{}", gadget.name()),
                     ts: event.ts(),
                 });
+                self.personality_lines.push(line);
             }
         }
         self.events.push(event);
@@ -97,7 +101,7 @@ impl Session {
                     ts: std::time::Instant::now(),
                 }
             };
-            if let Some(hint) = g.apply(&mut ev) {
+            if let Some(hint) = g.apply(&mut ev, self.dry_run) {
                 let line = self.personality.from_hint(&hint, &ev);
                 self.roast_count += 1;
                 self.distrust_score += hint.intensity as usize;
@@ -106,10 +110,11 @@ impl Session {
                     self.mutations_applied += 1;
                 }
                 self.events.push(Event::LogLine {
-                    msg: line,
+                    msg: line.clone(),
                     source: format!("gadget:{}", g.name()),
                     ts: ev.ts(),
                 });
+                self.personality_lines.push(line);
             }
         }
     }
@@ -130,6 +135,59 @@ impl Session {
         for e in events {
             self.ingest(e);
         }
+    }
+
+    /// Select/arm only the named gadgets from the cli --gadgets or config list.
+    /// If empty or "all", keeps defaults. Respects existing trait logic (no change to apply).
+    /// Used by main wiring for attach/run.
+    pub fn select_gadgets(&mut self, names: &[String]) {
+        if names.is_empty() || names.iter().any(|n| n == "all" || n == "default") {
+            return; // keep loaded defaults
+        }
+        let wanted: std::collections::HashSet<String> =
+            names.iter().map(|s| s.to_lowercase()).collect();
+        self.active_gadgets.retain(|g| wanted.contains(g.name()));
+        // if filter removed all (bad list), fall back to defaults for safety/voice
+        if self.active_gadgets.is_empty() {
+            self.active_gadgets = default_gadgets();
+        }
+    }
+
+    /// basic recording: save personality_lines (roasts + banners in exact voice) + fallback events to txt file.
+    /// id used for filename ghost-recording-<id>.txt . returns path for replay cmd + print.
+    /// called after attach/proxy/run exit. simple, no new deps.
+    pub fn save_recording(&self, id: &str) -> std::io::Result<String> {
+        let path = format!("ghost-recording-{}.txt", id);
+        let content = if !self.personality_lines.is_empty() {
+            self.personality_lines.join("\n")
+        } else {
+            // fallback: pull LogLines that carry voice (banners/roasts)
+            self.events
+                .iter()
+                .filter_map(|e| {
+                    if let Event::LogLine { msg, .. } = e {
+                        if msg.contains("👻")
+                            || msg.contains("zero chill")
+                            || msg.contains("they ALL")
+                            || msg.contains("fuck off")
+                            || msg.contains("XX")
+                            || msg.contains("lmao")
+                            || msg.contains("(¬")
+                            || msg.contains("💀")
+                        {
+                            Some(msg.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        std::fs::write(&path, &content)?;
+        Ok(path)
     }
 }
 
