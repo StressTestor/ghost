@@ -2,7 +2,7 @@
 
 **ghost** 👻 cli + tui for live visibility + deliberate chaos injection into real agent tool calls, cli commands, local services. offensive research counterpart to sentinel. "they ALL talk eventually XX"
 
-last updated: 2026-06-14 (initialized per approved design spec)
+last updated: 2026-06-14 (core: Event/Session/GhostFaceState data model + FULL Personality roast engine w/ produce_roast + exact @ThatbV voice + face updates; TDD red-green in event/session/personality + skeleton integration; personality now the heart)
 
 ## project overview
 
@@ -45,8 +45,8 @@ ghost/
 │   ├── cli.rs           # clap subcommands (attach, proxy, run, replay, gadgets)
 │   ├── config.rs        # GhostConfig + VoicePrefs + toml load (serde)
 │   ├── event.rs         # Event enum + PersonalityHint (core data model)
-│   ├── interceptor.rs   # attachment backends stub (command wrapper, proxy, tail). emits only events
-│   ├── session.rs       # owns live run, ingests events, applies gadgets, tracks roasts/mutations
+│   ├── interceptor.rs   # attachment backends (real v1: CommandWrapper using std::process for exec/capture of CommandOutput, ProxyStub). emits pure Events only. banners + dry_run safety. no gadgets/mutation here.
+│   ├── session.rs       # owns live run, ingests events (core bus), applies gadgets, tracks roasts/mutations/distrust/face. attach_with_interceptor(events) wires wrapper output. SessionMetrics for visibility.
 │   ├── personality.rs   # roast engine. single source of @ThatbV voice. kaomoji, blunt, "zero chill"
 │   ├── gadgets/
 │   │   └── mod.rs       # Gadget trait + stubs (PokeGadget, RoastGadget) + registry. apply returns hint
@@ -63,10 +63,12 @@ annotated:
 
 ## key patterns
 
-- **interception flow**: interceptor (backend pluggable) -> emits Event -> session.ingest() -> gadgets.apply() mutate + return PersonalityHint -> personality generates lines -> renderer or headless consumes. strict boundaries (interceptor never sees gadgets; renderer never mutates).
+- **interception flow**: interceptor (backend pluggable: CommandWrapper or ProxyStub) -> emits Event (CommandOutput, LogLine banner etc) -> session.attach_with_interceptor(vec) or ingest() (the event bus) -> gadgets.apply() + PersonalityHint -> personality + state (distrust, GhostFaceState) -> renderer/headless. strict boundaries (interceptor never sees gadgets; renderer never mutates).
 - **gadget pattern**: trait Gadget { name, description (voice), apply(&mut Event) -> Option<PersonalityHint> }. dry_run default true. real mutations explicit + scoped.
 - **personality central**: one engine. all output (logs, face states, reports, --help) goes through it. voice rules hardcoded from real X posts: kaomoji, "they ALL talk eventually XX", blunt, no hedge, security + glee mix.
-- **data model**: simple copy-friendly enums + structs (Event, Session, PersonalityHint, GhostFaceState stub). recordings = vecs for json/bincode later.
+- **data model**: simple copy-friendly enums + structs (Event, Session, PersonalityHint, GhostFaceState, SessionMetrics). recordings = vecs for json/bincode later.
+- **command wrapper (v1 primary)**: std::process::Command exec + capture stdout/stderr to CommandOutput events. always prints + emits "👻 ghost attached (observe only)" banner in voice. dry_run only for banner/observe wording + gadget count (exec of target always happens per attach intent). loud errors on fail ("well that was a silent no-op XX").
+- **basic event bus**: in Session (ingest + attach_with_interceptor). updates distrust_score + ghost_face_state on roasts. no channels yet (vec collect for v1 sync attach).
 - **safety first**: dry-run everywhere in v1. explicit banners on attach. no auto-mutate. resource limits planned.
 - **state management**: Session owns the truth for a run (events vec, counters, active gadgets, dry_run flag). no global.
 - **cli design**: subcommands + trailing args for attach. clap derive. long_about points at spec.
@@ -108,7 +110,7 @@ none. pure local. (future easy: sentinel hook format compat, gstack health hooks
 - **dry_run is default everywhere**: gadget + session + cli enforce observe-first. if you see real mutation without flag, that's a bug.
 - **personality lines must match voice**: if a roast lacks kaomoji or sounds corporate, fix in personality.rs (single source). tests assert on patterns like "(¬‿¬)".
 - **ratatui + crossterm versions**: resolved to 0.30/0.29 by cargo (spec listed older). update together if bumping. crossterm backend is default for ratatui.
-- **no real process exec yet**: interceptor.start() and attach only fake events. real wrapper (std::process + pipes or tokio) + clean exit is next work. do not assume live until implemented.
+- **real command wrapper live**: std::process in CommandWrapper.run(dry_run) does actual exec of user command (echo/ls etc tested), emits real captured lines as CommandOutput + banners. old Interceptor::start() kept for compat/skeleton. proxy is stub (no bind).
 - **tests use std::time::Instant**: no extra deps for timestamps in v1.
 - **clap trailing_var_arg for attach**: allows `ghost attach ./foo --bar` without eating flags. careful with subcommand parsing.
 
@@ -118,7 +120,8 @@ none. pure local. (future easy: sentinel hook format compat, gstack health hooks
 # dev
 cargo build
 cargo run -- --help
-cargo run -- attach ./test-agent
+cargo run -- attach echo hi --dry-run   # real wrapper: shows 👻 banner + captured events, voice kaomoji, no gadget mut in dry
+cargo run -- attach ls / --dry-run
 cargo run -- gadgets
 
 # test (tdd style, run often)

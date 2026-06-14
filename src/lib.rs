@@ -17,10 +17,11 @@ pub mod session;
 pub mod tui;
 
 // Re-exports for convenience at the top level.
-pub use event::{Event, PersonalityHint};
+pub use event::{Event, GhostFaceState, PersonalityHint};
 pub use gadgets::Gadget;
+pub use interceptor::{CommandWrapper, ProxyStub};
 pub use personality::PersonalityEngine;
-pub use session::Session;
+pub use session::{Session, SessionMetrics};
 
 // Trivial structure test for the skeleton init (TDD even on setup).
 // Exercises that modules are present, types connect, and basic flows work.
