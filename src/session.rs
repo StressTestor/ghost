@@ -154,10 +154,12 @@ impl Session {
     }
 
     /// basic recording: save personality_lines (roasts + banners in exact voice) + fallback events to txt file.
-    /// id used for filename ghost-recording-<id>.txt . returns path for replay cmd + print.
+    /// id used for filename ghost-recording-<id>.txt . returns the full path for replay cmd + print.
     /// called after attach/proxy/run exit. simple, no new deps.
     pub fn save_recording(&self, id: &str) -> std::io::Result<String> {
-        let path = format!("ghost-recording-{}.txt", id);
+        let dir = recordings_dir();
+        ensure_private_dir(&dir)?;
+        let path = dir.join(format!("ghost-recording-{}.txt", id));
         let content = if !self.personality_lines.is_empty() {
             self.personality_lines.join("\n")
         } else {
@@ -187,7 +189,7 @@ impl Session {
                 .join("\n")
         };
         std::fs::write(&path, &content)?;
-        Ok(path)
+        Ok(path.display().to_string())
     }
 
     /// project the live events into their serializable form (recording t=0 at
@@ -208,7 +210,9 @@ impl Session {
     /// .txt (which is for replay vibes), this is a real machine-readable trace —
     /// the thing the README means by "feed to your evals". returns the path.
     pub fn save_recording_jsonl(&self, id: &str) -> std::io::Result<String> {
-        let path = format!("ghost-recording-{}.jsonl", id);
+        let dir = recordings_dir();
+        ensure_private_dir(&dir)?;
+        let path = dir.join(format!("ghost-recording-{}.jsonl", id));
         let body = self
             .to_recorded_events()
             .iter()
@@ -216,8 +220,33 @@ impl Session {
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(&path, body)?;
-        Ok(path)
+        Ok(path.display().to_string())
     }
+}
+
+/// where recordings live: `~/.ghost/recordings`, falling back to the cwd only if
+/// there's no HOME. recordings (esp. the .jsonl) capture RAW command output, so
+/// they belong in ghost's private dir, NOT in whatever repo you ran `attach`
+/// from. does not create the dir — see `ensure_private_dir`.
+pub fn recordings_dir() -> std::path::PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) => std::path::Path::new(&home)
+            .join(".ghost")
+            .join("recordings"),
+        None => std::path::PathBuf::from("."),
+    }
+}
+
+/// create `dir` (recursively) and lock it to the owner (0700 on unix) since it
+/// holds captured command output. perms are best-effort.
+fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(())
 }
 
 /// Simple metrics struct for get_metrics (v1 bus visibility, no overengineer).

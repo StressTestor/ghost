@@ -131,12 +131,13 @@ impl TuiRenderer {
                 .to_string(),
         );
 
-        // seed with recent history, then tail only what's appended after.
-        let history = crate::watchlog::read_all(&path);
+        // seed with recent history AND capture the offset from the same read, so
+        // a record appended between "read history" and "start tailing" can't slip
+        // through the gap (it'd be in neither). offset = end of what we consumed.
+        let (history, mut offset) = crate::watchlog::read_from(&path, 0);
         for rec in history.iter().rev().take(30).rev() {
             app.ingest_call(rec);
         }
-        let mut offset = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
         enable_raw_mode()?;
         let mut out = stdout();
@@ -183,10 +184,11 @@ impl TuiRenderer {
             "👻 ghost watching the bridge feed at {} (headless). every tool call, live. zero chill 💀",
             path.display()
         );
-        for rec in crate::watchlog::read_all(&path).iter().rev().take(30).rev() {
+        // seed + capture offset from one read (no gap between history + tail).
+        let (history, mut offset) = crate::watchlog::read_from(&path, 0);
+        for rec in history.iter().rev().take(30).rev() {
             println!("  {}", crate::watchlog::format_watch_line(rec));
         }
-        let mut offset = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         loop {
             let (new, new_offset) = crate::watchlog::read_from(&path, offset);
             offset = new_offset;
@@ -229,23 +231,39 @@ impl TuiRenderer {
     /// basic replay from recording file (produced by Session::save_recording).
     /// loads voice lines (banners + roasts), replays with cycling ghost face sim + prints (for dogfood + headless).
     /// id: "123456" -> ghost-recording-123456.txt or explicit path.
-    /// resolve a recording id to a file path. forgiving: an explicit path/.txt
-    /// is used as-is; otherwise we try `ghost-recording-<id>.txt`, and if that
-    /// doesn't exist, fall back to the `attach-`-prefixed name recordings are
-    /// actually saved under (so a bare timestamp still finds its recording).
+    /// resolve a recording id to a file path. forgiving: an explicit path/.txt/
+    /// .jsonl is used as-is; otherwise we search for a `ghost-recording-<id>` file
+    /// (txt or jsonl, with the `attach-` prefix variants) first in `~/.ghost/
+    /// recordings` (where they live now), then the cwd (back-compat with older
+    /// recordings). a bare timestamp still finds its recording.
     fn resolve_recording(id: &str) -> String {
         if id.contains('/') || id.ends_with(".txt") || id.ends_with(".jsonl") {
             return id.to_string();
         }
-        let direct = format!("ghost-recording-{id}.txt");
-        if std::path::Path::new(&direct).exists() {
-            return direct;
+        let names = [
+            format!("ghost-recording-{id}.txt"),
+            format!("ghost-recording-{id}.jsonl"),
+            format!("ghost-recording-attach-{id}.txt"),
+            format!("ghost-recording-attach-{id}.jsonl"),
+        ];
+        let bases = [
+            crate::session::recordings_dir(),
+            std::path::PathBuf::from("."),
+        ];
+        for base in &bases {
+            for name in &names {
+                let p = base.join(name);
+                if p.exists() {
+                    return p.display().to_string();
+                }
+            }
         }
-        let prefixed = format!("ghost-recording-attach-{id}.txt");
-        if std::path::Path::new(&prefixed).exists() {
-            return prefixed;
-        }
-        direct
+        // nothing found: the canonical name in the recordings dir (replay will
+        // report a clean "no recording" miss).
+        crate::session::recordings_dir()
+            .join(format!("ghost-recording-{id}.txt"))
+            .display()
+            .to_string()
     }
 
     /// structured replay: a .jsonl recording (RecordedEvent per line) rendered

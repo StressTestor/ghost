@@ -14,9 +14,11 @@ ghost attach ./my-agent --gadgets poke,roast --dry-run
 ghost proxy 127.0.0.1:8080 127.0.0.1:3000
 ```
 
-terminal flips to dense spooky tui. the ghost face 👻 reacts live: side-eyes on sketchy calls, (¬‿¬) on good roasts, >:[ on silent no-ops.
+terminal flips to dense spooky tui. the ghost face 👻 reacts: side-eyes on sketchy calls, (¬‿¬) on good roasts, >:[ on silent no-ops.
 
-live activity scrolls real events (tool calls, responses, command output) with glitch + color. your comments in the stream: "this agent has zero chill 💀", "recursive gaslighting as a service", blunt + sharp.
+the face reacting LIVE to a real session is `ghost watch` (it tails the bridge feed). `attach` streams output live in headless; its tui opens on the captured trace once the command's done.
+
+activity scrolls real events (tool calls, responses, command output) with glitch + color. your comments in the stream: "this agent has zero chill 💀", "recursive gaslighting as a service", blunt + sharp.
 
 hit a key and a gadget fires: screen glitches, face goes party mode, while it actually mutates/drops/delays the stream (or just observes).
 
@@ -36,8 +38,8 @@ cargo build --release
 # list gadgets (voice descriptions included)
 ./target/release/ghost gadgets
 
-# attach a real thing (live tui face + streaming output)
-./target/release/ghost attach ./your-agent --dry-run
+# attach a thing (headless streams live; the tui opens on the captured trace)
+./target/release/ghost --headless attach ./your-agent --dry-run
 
 # or just play
 cargo run -- gadgets
@@ -100,19 +102,26 @@ ghost blocks
 ghost 👻
 live visibility + deliberate chaos for your agents, commands, localhost. complements sentinel. they ALL talk eventually XX
 
-Usage: ghost <COMMAND>
+Usage: ghost [OPTIONS] <COMMAND>
 
 Commands:
-  attach   Attach to a command / agent process (wrapper + capture).
-  proxy    Real TCP tee proxy: bind <listen>, forward to <target>, tee both ways.
-  run      Run from a full config file (toml). headless or tui depending on flags.
-  replay   Replay a previous session recording (text + face states + roasts).
-  gadgets  List available gadgets with your voice descriptions + hotkeys.
+  attach   Attach to a command / agent process (wrapper + live capture)
+  proxy    Real TCP tee proxy: bind <listen>, forward to <target>, tee both ways
+  run      Run from a full config file (toml)
+  replay   Replay a previous session recording (.txt voice, or structured .jsonl)
+  hook     PreToolUse bridge: run offense, defer to sentinel, narrate the verdict
+  install  Wire the ghost↔sentinel bridge into ~/.claude/settings.json
+  watch    Tail the bridge feed live and drive the ghost face in real time
+  blocks   What your agent kept trying: blocks by category / tool / command
+  gadgets  List available gadgets with your voice descriptions + hotkeys
+  config   Inspect ghost config (toml)
   help     Print this message or the help of the given subcommand(s)
 
 Options:
-  -h, --help     Print help
-  -V, --version  Print version
+      --headless        text only output with full voice. auto if no tty
+      --config <CONFIG> path to ghost config toml for gadgets/voice/targets
+  -h, --help            Print help
+  -V, --version         Print version
 ```
 
 (the long about points at the spec. no corporate fluff.)

@@ -156,16 +156,23 @@ pub fn read_from(path: &std::path::Path, offset: u64) -> (Vec<CallRecord>, u64) 
     if f.seek(SeekFrom::Start(start)).is_err() {
         return (Vec::new(), start);
     }
-    let mut buf = String::new();
-    if f.read_to_string(&mut buf).is_err() {
+    // read raw bytes (NOT read_to_string — one invalid-utf8 byte would error and,
+    // since we'd return without advancing, wedge the watcher into re-reading the
+    // same bytes forever). decode lossily; a corrupt line just fails to parse and
+    // is skipped, and the offset still advances past it.
+    let mut bytes = Vec::new();
+    if f.read_to_end(&mut bytes).is_err() {
         return (Vec::new(), start);
     }
-    // consume only through the last newline; keep the partial tail unread.
-    let consumed = buf.rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let records = buf[..consumed]
-        .lines()
-        .filter_map(CallRecord::from_jsonl)
-        .collect();
+    // consume only through the last newline, measured on the RAW bytes so the
+    // returned offset stays accurate against the file (lossy decode can change
+    // byte counts). the partial tail is left unread.
+    let consumed = match bytes.iter().rposition(|&b| b == b'\n') {
+        Some(i) => i + 1,
+        None => 0,
+    };
+    let text = String::from_utf8_lossy(&bytes[..consumed]);
+    let records = text.lines().filter_map(CallRecord::from_jsonl).collect();
     (records, start + consumed as u64)
 }
 
@@ -415,6 +422,43 @@ mod tests {
         append_call_to(&path, &CallRecord::from_outcome(&pass_outcome(), 3));
         let (recs2, _off2) = read_from(&path, off1);
         assert_eq!(recs2.len(), 2, "only the newly appended records");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_from_does_not_wedge_on_invalid_utf8() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join("ghost-watchlog-badutf8-7781400003.jsonl");
+        let _ = std::fs::remove_file(&path);
+
+        // a valid record, then a line with invalid utf8 bytes, then another valid one.
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            "{}",
+            CallRecord::from_outcome(&pass_outcome(), 1).to_jsonl()
+        )
+        .unwrap();
+        f.write_all(&[0xff, 0xfe, b'g', b'a', b'r', b'b', b'a', b'g', b'e', b'\n'])
+            .unwrap();
+        writeln!(
+            f,
+            "{}",
+            CallRecord::from_outcome(&block_outcome(), 2).to_jsonl()
+        )
+        .unwrap();
+        drop(f);
+
+        // must consume ALL three lines (offset advances past the bad bytes) and
+        // return the two parseable records — never get stuck re-reading.
+        let (recs, off) = read_from(&path, 0);
+        assert_eq!(recs.len(), 2, "skips the garbage line, keeps the good ones");
+        let total = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(
+            off, total,
+            "offset advanced past the invalid-utf8 line, no wedge"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

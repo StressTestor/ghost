@@ -3,7 +3,12 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// a write that stalls this long (a peer that stops reading and never closes)
+/// is treated as a dead connection and torn down, so one pathological client
+/// can't leak its relay threads forever. generous — localhost dev traffic.
+const PROXY_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Interceptor / Attachment layer.
 /// The real boundary (inspired by Sentinel hooks).
@@ -236,9 +241,12 @@ impl TcpTeeProxy {
         TcpListener::bind(&self.listen)
     }
 
-    /// bind + accept loop, teeing every connection live to `sink`. blocks until
-    /// an accept error (ctrl-c the process to stop). a connection that can't
-    /// reach the upstream is a loud event, not a crash — the proxy keeps serving.
+    /// bind + accept loop. each connection is teed on its OWN thread, so one
+    /// slow/stuck/half-open client can never block `accept()` and wedge the whole
+    /// proxy — new clients keep connecting. all connections funnel their events
+    /// into one channel that the calling thread drains to `sink` (single-threaded
+    /// sink, concurrent connections). blocks until ctrl-c / accept error; a bind
+    /// failure returns Err early (the one startup error worth propagating).
     /// `dry_run` only flavors the banner (a tee never mutates bytes regardless).
     pub fn serve(&self, dry_run: bool, sink: &mut dyn FnMut(Event)) -> std::io::Result<()> {
         let listener = self.bind()?;
@@ -257,34 +265,59 @@ impl TcpTeeProxy {
             ts: Instant::now(),
         });
 
-        loop {
-            match listener.accept() {
-                Ok((client, peer)) => {
-                    sink(Event::LogLine {
-                        msg: format!(
-                            "👻 client {peer} connected. teeing -> {} (¬‿¬)",
-                            self.target
-                        ),
-                        source: "proxy".to_string(),
-                        ts: Instant::now(),
-                    });
-                    Self::tee_connection(client, &self.target, sink);
-                }
-                Err(e) => {
-                    sink(Event::LogLine {
-                        msg: format!("proxy accept died: {e} >:[ well that was a silent no-op XX"),
-                        source: "error".to_string(),
-                        ts: Instant::now(),
-                    });
-                    return Err(e);
+        let (tx, rx) = mpsc::channel::<Event>();
+        let target = self.target.clone();
+        let acceptor = std::thread::spawn(move || {
+            loop {
+                match listener.accept() {
+                    Ok((client, peer)) => {
+                        let txc = tx.clone();
+                        let tgt = target.clone();
+                        let _ = txc.send(Event::LogLine {
+                            msg: format!("👻 client {peer} connected. teeing -> {tgt} (¬‿¬)"),
+                            source: "proxy".to_string(),
+                            ts: Instant::now(),
+                        });
+                        // own thread per connection: a stuck tee can't block accept().
+                        std::thread::spawn(move || {
+                            let mut s = |e| {
+                                let _ = txc.send(e);
+                            };
+                            Self::tee_connection(client, &tgt, &mut s);
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Event::LogLine {
+                            msg: format!(
+                                "proxy accept died: {e} >:[ well that was a silent no-op XX"
+                            ),
+                            source: "error".to_string(),
+                            ts: Instant::now(),
+                        });
+                        break; // drops tx; rx closes once live connections finish
+                    }
                 }
             }
+        });
+
+        // drain every connection's events to the sink as they arrive.
+        for ev in rx {
+            sink(ev);
         }
+        let _ = acceptor.join();
+        Ok(())
     }
 
     /// handle ONE accepted client: dial the upstream, tee both directions to
     /// completion, return when the connection closes. the testable unit (no
     /// infinite accept loop). errors are loud events, never panics.
+    ///
+    /// teardown: a clean EOF half-closes only (so e.g. an HTTP client that
+    /// `shutdown(Write)` after its request still gets the response); a read/write
+    /// ERROR tears both sockets fully down so the sibling copy thread unblocks and
+    /// nothing leaks. a write that stalls past PROXY_WRITE_TIMEOUT counts as an
+    /// error. (a peer that goes fully idle — no data, no FIN, no error — can still
+    /// hold its two relay threads, but it's isolated to that one connection.)
     pub fn tee_connection(client: TcpStream, target: &str, sink: &mut dyn FnMut(Event)) {
         let upstream = match TcpStream::connect(target) {
             Ok(s) => s,
@@ -299,6 +332,9 @@ impl TcpTeeProxy {
                 return;
             }
         };
+        // bound a stalled write so a peer that stops reading can't park a thread forever.
+        let _ = client.set_write_timeout(Some(PROXY_WRITE_TIMEOUT));
+        let _ = upstream.set_write_timeout(Some(PROXY_WRITE_TIMEOUT));
 
         // two readers, one writer-half each, both teeing into one channel so the
         // sink stays single-threaded. clone gives independent handles to each socket.
@@ -335,16 +371,24 @@ impl TcpTeeProxy {
 }
 
 /// copy bytes from `from` to `to`, teeing each chunk as a CommandOutput event
-/// tagged with the direction. on EOF, half-close the write side so the peer
-/// sees the close and the other direction can finish. errors end the copy quietly
-/// (the connection is just done).
+/// tagged with the direction. clean EOF half-closes the write side (preserving
+/// the other direction — half-close is legal + needed for request/response). a
+/// read/write ERROR (incl. a stalled-write timeout) means the connection is
+/// broken, so tear BOTH sockets fully down — that unblocks the sibling copy
+/// thread's parked read/write instead of leaking it.
 fn copy_tee(mut from: TcpStream, mut to: TcpStream, dir: &str, tx: &mpsc::Sender<Event>) {
     let mut buf = [0u8; 4096];
+    let mut errored = false;
     loop {
         match from.read(&mut buf) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break, // clean EOF
+            Err(_) => {
+                errored = true;
+                break;
+            }
             Ok(n) => {
                 if to.write_all(&buf[..n]).is_err() {
+                    errored = true;
                     break;
                 }
                 let _ = tx.send(Event::CommandOutput {
@@ -355,8 +399,14 @@ fn copy_tee(mut from: TcpStream, mut to: TcpStream, dir: &str, tx: &mpsc::Sender
             }
         }
     }
-    // best-effort half-close so the other side unblocks.
-    let _ = to.shutdown(Shutdown::Write);
+    if errored {
+        // broken connection: force the whole thing down so the sibling unblocks.
+        let _ = from.shutdown(Shutdown::Both);
+        let _ = to.shutdown(Shutdown::Both);
+    } else {
+        // clean EOF: half-close only, let the other direction finish draining.
+        let _ = to.shutdown(Shutdown::Write);
+    }
 }
 
 /// short, single-line, utf8-lossy preview of a wire chunk (not the raw bytes).
