@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::time::Instant;
 
 /// Core event types for the interception stream.
@@ -38,6 +39,92 @@ pub enum Event {
 pub struct PersonalityHint {
     pub text: String,
     pub intensity: u8, // 0-10, drives ghost face etc
+}
+
+/// Serializable projection of an `Event` for on-disk recordings (JSONL).
+/// `Event` itself stays on `Instant` (monotonic, right for the live model but
+/// not serializable across runs); this captures a recording-friendly view:
+/// `seq` for order, `t_ms` for relative timing (ms since the first event), and
+/// the payload. one `RecordedEvent` per line = a structured trace you can
+/// actually feed to evals, not just voice .txt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind")]
+pub enum RecordedEvent {
+    ToolCall {
+        seq: usize,
+        t_ms: u64,
+        name: String,
+        args: String,
+    },
+    Response {
+        seq: usize,
+        t_ms: u64,
+        body: String,
+        status: Option<u16>,
+    },
+    CommandOutput {
+        seq: usize,
+        t_ms: u64,
+        line: String,
+        stream: String,
+    },
+    Log {
+        seq: usize,
+        t_ms: u64,
+        msg: String,
+        source: String,
+    },
+}
+
+impl RecordedEvent {
+    /// project a live `Event` into its recordable form. `t_ms` is this event's
+    /// offset from `first_ts` (the recording's t=0), so timing survives even
+    /// though the absolute Instant doesn't.
+    pub fn from_event(ev: &Event, seq: usize, first_ts: Instant) -> Self {
+        let t_ms = ev.ts().saturating_duration_since(first_ts).as_millis() as u64;
+        match ev {
+            Event::ToolCall { name, args, .. } => RecordedEvent::ToolCall {
+                seq,
+                t_ms,
+                name: name.clone(),
+                args: args.clone(),
+            },
+            Event::Response { body, status, .. } => RecordedEvent::Response {
+                seq,
+                t_ms,
+                body: body.clone(),
+                status: *status,
+            },
+            Event::CommandOutput { line, stream, .. } => RecordedEvent::CommandOutput {
+                seq,
+                t_ms,
+                line: line.clone(),
+                stream: stream.clone(),
+            },
+            Event::LogLine { msg, source, .. } => RecordedEvent::Log {
+                seq,
+                t_ms,
+                msg: msg.clone(),
+                source: source.clone(),
+            },
+        }
+    }
+
+    /// one compact JSONL line (no newline). serialization of plain data can't
+    /// fail; on the impossible chance it does, emit a minimal valid object.
+    pub fn to_jsonl(&self) -> String {
+        serde_json::to_string(self)
+            .unwrap_or_else(|_| r#"{"kind":"Log","msg":"<unserializable>"}"#.to_string())
+    }
+
+    /// parse one JSONL line back; junk -> None (forgiving replay).
+    pub fn from_jsonl(line: &str) -> Option<Self> {
+        let t = line.trim();
+        if t.is_empty() {
+            return None;
+        }
+        serde_json::from_str(t).ok()
+    }
 }
 
 impl Event {
@@ -133,6 +220,67 @@ mod tests {
             ts,
         };
         assert_eq!(cmd.source(), "command");
+    }
+
+    #[test]
+    fn recorded_event_projects_each_variant_and_roundtrips() {
+        let t0 = Instant::now();
+        let tc = Event::ToolCall {
+            name: "Read".into(),
+            args: r#"{"p":"x"}"#.into(),
+            ts: t0,
+        };
+        let rec = RecordedEvent::from_event(&tc, 0, t0);
+        match &rec {
+            RecordedEvent::ToolCall {
+                seq,
+                name,
+                args,
+                t_ms,
+            } => {
+                assert_eq!(*seq, 0);
+                assert_eq!(name, "Read");
+                assert_eq!(args, r#"{"p":"x"}"#);
+                assert_eq!(*t_ms, 0, "first event is at t=0");
+            }
+            _ => panic!("wrong variant"),
+        }
+        // jsonl roundtrip
+        let line = rec.to_jsonl();
+        assert!(line.contains("\"kind\":\"ToolCall\""));
+        assert!(!line.contains('\n'));
+        assert_eq!(RecordedEvent::from_jsonl(&line), Some(rec));
+
+        // other variants project cleanly too
+        let resp = Event::Response {
+            body: "ok".into(),
+            status: Some(200),
+            ts: t0,
+        };
+        assert!(matches!(
+            RecordedEvent::from_event(&resp, 1, t0),
+            RecordedEvent::Response {
+                status: Some(200),
+                seq: 1,
+                ..
+            }
+        ));
+        let log = Event::LogLine {
+            msg: "hi".into(),
+            source: "x".into(),
+            ts: t0,
+        };
+        assert!(matches!(
+            RecordedEvent::from_event(&log, 2, t0),
+            RecordedEvent::Log { .. }
+        ));
+    }
+
+    #[test]
+    fn recorded_event_from_jsonl_is_forgiving() {
+        assert!(RecordedEvent::from_jsonl("").is_none());
+        assert!(RecordedEvent::from_jsonl("{not json").is_none());
+        assert!(RecordedEvent::from_jsonl(r#"{"kind":"Nope"}"#).is_none());
     }
 
     #[test]

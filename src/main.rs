@@ -95,6 +95,13 @@ fn main() {
                 // ts, which pointed replay at a file that does not exist).
                 println!("recording saved: {} (use: ghost replay {})", p, rec_id);
             }
+            // structured trace too: machine-readable JSONL you can feed to evals.
+            if let Ok(jp) = session.save_recording_jsonl(&rec_id) {
+                println!(
+                    "structured trace: {} (jsonl, replay with: ghost replay {})",
+                    jp, jp
+                );
+            }
 
             if is_headless {
                 // events already streamed live above; just the summary + face.

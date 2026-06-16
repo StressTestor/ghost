@@ -16,7 +16,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Widget, Wrap},
 };
 
-use crate::event::{Event, GhostFaceState};
+use crate::event::{Event, GhostFaceState, RecordedEvent};
 use crate::gadgets::default_gadgets;
 use crate::session::Session;
 
@@ -234,7 +234,7 @@ impl TuiRenderer {
     /// doesn't exist, fall back to the `attach-`-prefixed name recordings are
     /// actually saved under (so a bare timestamp still finds its recording).
     fn resolve_recording(id: &str) -> String {
-        if id.contains('/') || id.ends_with(".txt") {
+        if id.contains('/') || id.ends_with(".txt") || id.ends_with(".jsonl") {
             return id.to_string();
         }
         let direct = format!("ghost-recording-{id}.txt");
@@ -248,8 +248,52 @@ impl TuiRenderer {
         direct
     }
 
+    /// structured replay: a .jsonl recording (RecordedEvent per line) rendered
+    /// back in voice with its relative timing + sequence. this is the trace you
+    /// can also hand to evals — replay just makes it human here.
+    fn replay_jsonl(path: &str, id: &str) -> String {
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                let mut out = format!(
+                    "👻 replaying structured trace {} (¬‿¬) machine-readable. they ALL talk eventually XX\n",
+                    id
+                );
+                let faces = ["👻", "(¬‿¬)", "💀👻(¬‿¬)", ">:[", "(｡◕‿↼)", "ಠ‿ಠ", "💀"];
+                let mut n = 0usize;
+                for line in content.lines() {
+                    if let Some(rec) = RecordedEvent::from_jsonl(line) {
+                        let f = faces[n % faces.len()];
+                        let rendered = format!("{} {}", f, describe_record(&rec));
+                        println!("{}", rendered);
+                        out.push_str(&rendered);
+                        out.push('\n');
+                        n += 1;
+                    }
+                }
+                let closer = format!(
+                    "replay complete. {n} structured events. zero chill 💀 they ALL talk eventually XX"
+                );
+                println!("{}", closer);
+                out.push_str(&closer);
+                out.push('\n');
+                out
+            }
+            Err(e) => {
+                let msg = format!(
+                    "👻 no structured recording for {} at {}. silent no-op XX. err: {}",
+                    id, path, e
+                );
+                println!("{}", msg);
+                msg
+            }
+        }
+    }
+
     pub fn replay(id: &str) -> String {
         let path = Self::resolve_recording(id);
+        if path.ends_with(".jsonl") {
+            return Self::replay_jsonl(&path, id);
+        }
 
         match std::fs::read_to_string(&path) {
             Ok(content) => {
@@ -307,6 +351,26 @@ pub fn render_event_line(ev: &Event) -> String {
         Event::CommandOutput { line, stream, .. } => format!("[{stream}] {line}"),
         Event::ToolCall { name, args, .. } => format!("[toolcall] {name} args={args}"),
         Event::Response { body, status, .. } => format!("[response] {body} status={status:?}"),
+    }
+}
+
+/// one-line human description of a structured recording event (for jsonl replay).
+/// keeps the [seq] + relative ms so the trace reads in order with timing.
+pub fn describe_record(rec: &RecordedEvent) -> String {
+    match rec {
+        RecordedEvent::ToolCall {
+            seq, t_ms, name, ..
+        } => format!("[{seq}|{t_ms}ms] tool {name}"),
+        RecordedEvent::Response {
+            seq, t_ms, status, ..
+        } => format!("[{seq}|{t_ms}ms] response status={status:?}"),
+        RecordedEvent::CommandOutput {
+            seq,
+            t_ms,
+            line,
+            stream,
+        } => format!("[{seq}|{t_ms}ms] {stream}: {line}"),
+        RecordedEvent::Log { seq, t_ms, msg, .. } => format!("[{seq}|{t_ms}ms] {msg}"),
     }
 }
 
@@ -998,6 +1062,46 @@ mod tests {
             GhostFaceState::ZeroChill,
             "one boring pass shouldn't reset a hot face"
         );
+    }
+
+    #[test]
+    fn replay_renders_a_structured_jsonl_recording() {
+        let path = "ghost-recording-jsonl-replay-unit-1781400001.jsonl";
+        let recs = [
+            RecordedEvent::ToolCall {
+                seq: 0,
+                t_ms: 0,
+                name: "Read".into(),
+                args: "{}".into(),
+            },
+            RecordedEvent::CommandOutput {
+                seq: 1,
+                t_ms: 12,
+                line: "hello world".into(),
+                stream: "stdout".into(),
+            },
+        ];
+        let body = recs
+            .iter()
+            .map(|r| r.to_jsonl())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(path, body).unwrap();
+
+        let out = TuiRenderer::replay(path);
+        assert!(
+            out.contains("structured trace"),
+            "jsonl path -> structured replay"
+        );
+        assert!(out.contains("tool Read"), "renders the tool call");
+        assert!(
+            out.contains("stdout: hello world"),
+            "renders command output"
+        );
+        assert!(out.contains("2 structured events"));
+        assert!(!out.contains("no structured recording"));
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

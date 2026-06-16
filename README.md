@@ -20,7 +20,7 @@ live activity scrolls real events (tool calls, responses, command output) with g
 
 hit a key and a gadget fires: screen glitches, face goes party mode, while it actually mutates/drops/delays the stream (or just observes).
 
-leaves session traces with personality baked in. replay later. feed to your evals.
+leaves session traces with personality baked in. replay later. and a structured `.jsonl` trace (one event per line, seq + timing) you can actually feed to your evals.
 
 feels like having @ThatbV living in your tmux pane, professionally distrustful until something admits the vuln.
 
@@ -126,7 +126,7 @@ in:
 - real TCP tee proxy (binds, forwards, tees both directions; no TLS)
 - interception for cli + simple agent streams
 - toml config (gadgets, voice, targets)
-- session recording + replay (basic)
+- session recording (voice .txt + structured .jsonl you can feed to evals) + replay
 - headless mode with roasts + json artifacts
 - safety: dry run default, banners, scoping
 - tests (unit for gadgets/personality, structure tests)
@@ -198,7 +198,7 @@ update ARCHITECTURE.md on any structural change (new modules, deps, etc).
 
 ## status
 
-v1 is real: interception, 7 gadgets, full tui, headless, config, recording, and the sentinel bridge (`ghost hook` / `ghost install`) verified end-to-end against the real sentinel binary. 63 tests, clippy + fmt clean.
+v1 is real: streaming interception, real TCP tee proxy, 7 gadgets, full tui, headless, config, structured + voice recordings, the sentinel bridge (`ghost hook` / `ghost install`) verified end-to-end against the real sentinel binary, and the live `ghost watch` / `ghost blocks` views off the bridge feed. 85 tests, clippy + fmt clean.
 
 built because the space needed a loud offensive counterpart to the defensive tooling. for science lmao.
 
