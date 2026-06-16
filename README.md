@@ -10,8 +10,8 @@ i built this because watching tool calls in logs is soul-crushing. wanted a loud
 
 ```
 ghost attach ./my-agent --gadgets poke,roast --dry-run
-# or
-ghost proxy localhost:8080
+# or tee a localhost service (real TCP proxy: listen -> target)
+ghost proxy 127.0.0.1:8080 127.0.0.1:3000
 ```
 
 terminal flips to dense spooky tui. the ghost face 👻 reacts live: side-eyes on sketchy calls, (¬‿¬) on good roasts, >:[ on silent no-ops.
@@ -36,7 +36,7 @@ cargo build --release
 # list gadgets (voice descriptions included)
 ./target/release/ghost gadgets
 
-# attach a real thing (stub tui for now)
+# attach a real thing (live tui face + streaming output)
 ./target/release/ghost attach ./your-agent --dry-run
 
 # or just play
@@ -104,7 +104,7 @@ Usage: ghost <COMMAND>
 
 Commands:
   attach   Attach to a command / agent process (wrapper + capture).
-  proxy    Proxy a local addr (http-ish or raw for now). Simple tokio backend.
+  proxy    Real TCP tee proxy: bind <listen>, forward to <target>, tee both ways.
   run      Run from a full config file (toml). headless or tui depending on flags.
   replay   Replay a previous session recording (text + face states + roasts).
   gadgets  List available gadgets with your voice descriptions + hotkeys.
@@ -122,7 +122,8 @@ Options:
 in:
 - `ghost` binary, clap subcommands (attach, proxy, run, replay, gadgets, config path)
 - ratatui tui with live ghost face (4-6 expressions), activity, gadget bar, status strip, personality log
-- 5-7 core gadgets with dry-run real effects on command wrapper + basic proxy (stubs + a couple working in skeleton)
+- 5-7 core gadgets with dry-run real effects on the command wrapper
+- real TCP tee proxy (binds, forwards, tees both directions; no TLS)
 - interception for cli + simple agent streams
 - toml config (gadgets, voice, targets)
 - session recording + replay (basic)
@@ -146,7 +147,7 @@ full details + gadget catalog + exact voice examples: `docs/superpowers/specs/20
 
 ```
 ghost attach <command...> [--gadgets poke,roast] [--dry-run]
-ghost proxy <addr>
+ghost proxy <listen> <target>       # real TCP tee proxy: forward listen -> target, watch both ways
 ghost run --config my-chaos.toml
 ghost replay <session-id>
 ghost watch [--path <feed.jsonl>]    # tail the bridge feed live, face reacts in real time

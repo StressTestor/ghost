@@ -1,7 +1,7 @@
 use ghost::cli::{Cli, Commands};
 use ghost::config::GhostConfig;
 use ghost::gadgets::default_gadgets;
-use ghost::interceptor::{CommandWrapper, ProxyStub};
+use ghost::interceptor::{CommandWrapper, TcpTeeProxy};
 use ghost::session::Session;
 use ghost::tui::TuiRenderer;
 use std::io::IsTerminal;
@@ -125,33 +125,22 @@ fn main() {
             }
         }
 
-        Commands::Proxy { addr } => {
-            println!("👻 ghost proxy mode on {}", addr);
-            println!("tokio backend stub. simple http/raw for v1. (¬‿¬)");
-            println!("> this is where the live stream + gadget slots will live.");
+        Commands::Proxy { listen, target } => {
+            println!("👻 ghost proxy: {} -> {} (¬‿¬)", listen, target);
+            println!("real TCP tee. raw bytes both ways, no TLS, no mutation. ctrl-c to stop.");
 
-            let mut session = Session::new(format!("proxy:{}", addr));
-            // proxy stub respects dry_run in banner text
-            println!("attaching proxy stub interceptor...");
-            let proxy = ProxyStub::new(addr);
-            let events = proxy.run(session.dry_run);
-            session.attach_with_interceptor(events);
-
-            println!("--- proxy event stream ---");
-            for ev in &session.events {
-                if let ghost::Event::LogLine { msg, .. } = ev {
-                    println!("  {}", msg);
-                }
+            let mut session = Session::new(format!("proxy {listen} -> {target}"));
+            let proxy = TcpTeeProxy::new(&listen, &target);
+            // a proxy is a live server: stream every teed chunk to the terminal
+            // (+ ingest into the bus for roasts) as it flows. blocks until ctrl-c.
+            let dry = session.dry_run;
+            if let Err(e) = proxy.serve(dry, &mut |ev| {
+                println!("  {}", ghost::tui::render_event_line(&ev));
+                session.ingest(ev);
+            }) {
+                eprintln!(">:[ proxy stopped: {e}. they ALL talk eventually XX");
             }
             println!("{}", session.summary());
-
-            if is_headless {
-                let renderer = TuiRenderer::new();
-                renderer.run_headless(&session);
-            } else {
-                let renderer = TuiRenderer::new();
-                renderer.run(session);
-            }
         }
 
         Commands::Run { config } => {

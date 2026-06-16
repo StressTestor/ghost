@@ -63,8 +63,16 @@ pub enum Commands {
         dry_run: bool,
     },
 
-    /// Proxy a local addr (http-ish or raw for now). Simple tokio backend.
-    Proxy { addr: String },
+    /// Real TCP tee proxy: bind <listen>, forward to <target>, tee both
+    /// directions onto the bus so you can watch a localhost service's traffic
+    /// live. raw byte tee, no TLS, no mutation, local only.
+    /// Example: ghost proxy 127.0.0.1:8080 127.0.0.1:3000
+    Proxy {
+        /// addr ghost binds and listens on (e.g. 127.0.0.1:8080)
+        listen: String,
+        /// upstream addr ghost forwards to (e.g. 127.0.0.1:3000)
+        target: String,
+    },
 
     /// Run from a full config file (toml). headless or tui depending on flags.
     /// batch over targets in config if present.

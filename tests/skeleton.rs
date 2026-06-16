@@ -243,6 +243,103 @@ fn command_wrapper_streams_events_live_via_sink() {
 }
 
 #[test]
+fn tcp_tee_proxy_actually_forwards_bytes_both_ways_and_tees_events() {
+    use ghost::interceptor::TcpTeeProxy;
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+
+    // 1) a real upstream that echoes whatever it receives.
+    let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+    let upstream_addr = upstream.local_addr().unwrap().to_string();
+    let up = std::thread::spawn(move || {
+        let (mut s, _) = upstream.accept().unwrap();
+        let mut buf = [0u8; 1024];
+        loop {
+            match s.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if s.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // 2) the proxy's listen socket; one accept -> tee_connection to the upstream.
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap().to_string();
+    let events = Arc::new(Mutex::new(Vec::<Event>::new()));
+    let ev2 = Arc::clone(&events);
+    let proxy = std::thread::spawn(move || {
+        let (client, _) = proxy_listener.accept().unwrap();
+        TcpTeeProxy::tee_connection(client, &upstream_addr, &mut |e| ev2.lock().unwrap().push(e));
+    });
+
+    // 3) a client talks to the PROXY and must get its bytes echoed back through it.
+    let mut client = TcpStream::connect(&proxy_addr).unwrap();
+    client.write_all(b"ping ghost").unwrap();
+    client.shutdown(Shutdown::Write).unwrap(); // EOF so the tee can drain + close
+    let mut got = String::new();
+    client.read_to_string(&mut got).unwrap();
+    assert_eq!(
+        got, "ping ghost",
+        "bytes round-tripped through the real proxy"
+    );
+
+    proxy.join().unwrap();
+    up.join().unwrap();
+
+    // 4) both directions were teed onto the bus as events.
+    let evs = events.lock().unwrap();
+    let dirs: Vec<String> = evs
+        .iter()
+        .filter_map(|e| match e {
+            Event::CommandOutput { stream, .. } => Some(stream.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        dirs.iter().any(|d| d == "client→target"),
+        "client->target teed"
+    );
+    assert!(
+        dirs.iter().any(|d| d == "target→client"),
+        "target->client teed"
+    );
+}
+
+#[test]
+fn tcp_tee_proxy_unreachable_upstream_is_loud_not_a_panic() {
+    use ghost::interceptor::TcpTeeProxy;
+    use std::net::{TcpListener, TcpStream};
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap().to_string();
+    let mut seen: std::sync::Arc<std::sync::Mutex<Vec<Event>>> = Default::default();
+    let s2 = std::sync::Arc::clone(&seen);
+    let h = std::thread::spawn(move || {
+        let (client, _) = proxy_listener.accept().unwrap();
+        // 127.0.0.1:1 is a privileged/closed port -> connect fails fast.
+        TcpTeeProxy::tee_connection(client, "127.0.0.1:1", &mut |e| s2.lock().unwrap().push(e));
+    });
+    let _client = TcpStream::connect(&proxy_addr).unwrap();
+    h.join().unwrap();
+
+    let evs = std::sync::Arc::get_mut(&mut seen)
+        .unwrap()
+        .get_mut()
+        .unwrap();
+    assert!(
+        evs.iter()
+            .any(|e| matches!(e, Event::LogLine { msg, source, .. }
+            if source == "error" && msg.contains("unreachable"))),
+        "unreachable upstream must emit a loud error event"
+    );
+}
+
+#[test]
 fn command_wrapper_bad_cmd_streams_loud_error_and_nonzero() {
     let wrapper =
         ghost::interceptor::CommandWrapper::new(vec!["definitely-not-a-real-cmd-xyz-789".into()]);
