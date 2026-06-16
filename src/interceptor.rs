@@ -1,6 +1,14 @@
 use crate::event::Event;
-use std::process::Command;
-use std::time::Instant;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+/// a write that stalls this long (a peer that stops reading and never closes)
+/// is treated as a dead connection and torn down, so one pathological client
+/// can't leak its relay threads forever. generous — localhost dev traffic.
+const PROXY_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Interceptor / Attachment layer.
 /// The real boundary (inspired by Sentinel hooks).
@@ -73,7 +81,27 @@ impl CommandWrapper {
     /// Run the wrapper: exec + full capture -> Vec<Event> for the bus.
     /// dry_run: true -> "observe only" banner (safety default). Command still runs (attach = watch your thing).
     /// Returns events including banner LogLine + per-line CommandOutput + final exit log.
+    ///
+    /// thin collector over `run_streaming`: same events, same order, just buffered
+    /// into a Vec for callers (and the TUI) that review post-hoc. live consumers
+    /// (headless attach) call `run_streaming` directly so output scrolls as it lands.
     pub fn run(&self, dry_run: bool) -> Vec<Event> {
+        let mut events: Vec<Event> = Vec::new();
+        self.run_streaming(dry_run, &mut |e| events.push(e));
+        events
+    }
+
+    /// Stream the wrapped command's output LIVE: each captured line is handed to
+    /// `sink` the instant it arrives, not after the process exits. this is what
+    /// makes "live activity scrolls real events" actually true.
+    ///
+    /// stdout + stderr are drained on separate threads into one channel, so a
+    /// chatty stream on one pipe can't deadlock by filling its buffer while we
+    /// block on the other. order within a stream is preserved; cross-stream order
+    /// is arrival order. returns the child's exit code (-1 if it never launched).
+    /// dry_run only flavors the banner — attach always execs the target (you asked
+    /// to watch your thing); ghost itself never mutates the command.
+    pub fn run_streaming(&self, dry_run: bool, sink: &mut dyn FnMut(Event)) -> i32 {
         let target = if self.command.is_empty() {
             "(empty)".to_string()
         } else {
@@ -94,52 +122,31 @@ impl CommandWrapper {
 
         // explicit attached banner, per spec safety. stderr so it shows even if stdout captured.
         eprintln!("{}", banner);
-
-        let mut events: Vec<Event> = vec![Event::LogLine {
-            msg: banner.clone(),
+        sink(Event::LogLine {
+            msg: banner,
             source: "interceptor:command".to_string(),
             ts: Instant::now(),
-        }];
+        });
 
         if self.command.is_empty() {
-            events.push(Event::LogLine {
+            sink(Event::LogLine {
                 msg: "no command provided. fuck off pete energy".to_string(),
                 source: "error".to_string(),
                 ts: Instant::now(),
             });
-            return events;
+            return -1;
         }
 
         let cmd_name = &self.command[0];
         let args: Vec<&str> = self.command[1..].iter().map(|s| s.as_str()).collect();
 
-        match Command::new(cmd_name).args(&args).output() {
-            Ok(output) => {
-                for line in String::from_utf8_lossy(&output.stdout).lines() {
-                    if !line.trim().is_empty() {
-                        events.push(Event::CommandOutput {
-                            line: line.to_string(),
-                            stream: "stdout".to_string(),
-                            ts: Instant::now(),
-                        });
-                    }
-                }
-                for line in String::from_utf8_lossy(&output.stderr).lines() {
-                    if !line.trim().is_empty() {
-                        events.push(Event::CommandOutput {
-                            line: line.to_string(),
-                            stream: "stderr".to_string(),
-                            ts: Instant::now(),
-                        });
-                    }
-                }
-                let code = output.status.code();
-                events.push(Event::LogLine {
-                    msg: format!("command exited with code: {:?} 👻", code),
-                    source: "interceptor:command".to_string(),
-                    ts: Instant::now(),
-                });
-            }
+        let mut child = match Command::new(cmd_name)
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
             Err(e) => {
                 // fail loudly, never swallow. voice per @ThatbV style.
                 let err_msg = format!(
@@ -147,58 +154,270 @@ impl CommandWrapper {
                     target, e
                 );
                 eprintln!(">[: {}", err_msg);
-                events.push(Event::LogLine {
+                sink(Event::LogLine {
                     msg: err_msg,
                     source: "error".to_string(),
                     ts: Instant::now(),
                 });
+                return -1;
+            }
+        };
+
+        let (tx, rx) = mpsc::channel::<Event>();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        let tx_out = tx.clone();
+        let h_out = std::thread::spawn(move || {
+            if let Some(o) = stdout {
+                for line in BufReader::new(o).lines().map_while(Result::ok) {
+                    if !line.trim().is_empty() {
+                        let _ = tx_out.send(Event::CommandOutput {
+                            line,
+                            stream: "stdout".to_string(),
+                            ts: Instant::now(),
+                        });
+                    }
+                }
+            }
+        });
+        let tx_err = tx.clone();
+        let h_err = std::thread::spawn(move || {
+            if let Some(e) = stderr {
+                for line in BufReader::new(e).lines().map_while(Result::ok) {
+                    if !line.trim().is_empty() {
+                        let _ = tx_err.send(Event::CommandOutput {
+                            line,
+                            stream: "stderr".to_string(),
+                            ts: Instant::now(),
+                        });
+                    }
+                }
+            }
+        });
+        // drop our own sender so the channel closes once both readers finish.
+        drop(tx);
+
+        // LIVE: each line hits the sink as it arrives off the pipes.
+        for ev in rx {
+            sink(ev);
+        }
+        let _ = h_out.join();
+        let _ = h_err.join();
+
+        let code = child.wait().ok().and_then(|s| s.code());
+        sink(Event::LogLine {
+            msg: format!("command exited with code: {:?} 👻", code),
+            source: "interceptor:command".to_string(),
+            ts: Instant::now(),
+        });
+        code.unwrap_or(-1)
+    }
+}
+
+/// Real minimal TCP tee proxy for `ghost proxy <listen> <target>`.
+/// ghost binds `listen`, forwards every connection to `target`, and tees BOTH
+/// directions onto the event bus so you can watch (and roast) a localhost
+/// service's traffic as it flows. raw byte tee — no TLS, no protocol parsing,
+/// no mutation. local only. (the old ProxyStub never bound a socket; this one
+/// actually does — the README isn't advertising vapor anymore.)
+#[derive(Debug, Clone)]
+pub struct TcpTeeProxy {
+    pub listen: String,
+    pub target: String,
+}
+
+impl TcpTeeProxy {
+    pub fn new(listen: impl Into<String>, target: impl Into<String>) -> Self {
+        Self {
+            listen: listen.into(),
+            target: target.into(),
+        }
+    }
+
+    /// bind the listen socket (exposed so the binary + tests can learn the
+    /// bound addr, e.g. when listening on `:0`).
+    pub fn bind(&self) -> std::io::Result<TcpListener> {
+        TcpListener::bind(&self.listen)
+    }
+
+    /// bind + accept loop. each connection is teed on its OWN thread, so one
+    /// slow/stuck/half-open client can never block `accept()` and wedge the whole
+    /// proxy — new clients keep connecting. all connections funnel their events
+    /// into one channel that the calling thread drains to `sink` (single-threaded
+    /// sink, concurrent connections). blocks until ctrl-c / accept error; a bind
+    /// failure returns Err early (the one startup error worth propagating).
+    /// `dry_run` only flavors the banner (a tee never mutates bytes regardless).
+    pub fn serve(&self, dry_run: bool, sink: &mut dyn FnMut(Event)) -> std::io::Result<()> {
+        let listener = self.bind()?;
+        let local = listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| self.listen.clone());
+        let banner = format!(
+            "👻 ghost proxy listening on {local} -> {} (dry_run={dry_run}) (｡◕‿↼) teeing everything. for science",
+            self.target
+        );
+        eprintln!("{banner}");
+        sink(Event::LogLine {
+            msg: banner,
+            source: "interceptor:proxy".to_string(),
+            ts: Instant::now(),
+        });
+
+        let (tx, rx) = mpsc::channel::<Event>();
+        let target = self.target.clone();
+        let acceptor = std::thread::spawn(move || {
+            loop {
+                match listener.accept() {
+                    Ok((client, peer)) => {
+                        let txc = tx.clone();
+                        let tgt = target.clone();
+                        let _ = txc.send(Event::LogLine {
+                            msg: format!("👻 client {peer} connected. teeing -> {tgt} (¬‿¬)"),
+                            source: "proxy".to_string(),
+                            ts: Instant::now(),
+                        });
+                        // own thread per connection: a stuck tee can't block accept().
+                        std::thread::spawn(move || {
+                            let mut s = |e| {
+                                let _ = txc.send(e);
+                            };
+                            Self::tee_connection(client, &tgt, &mut s);
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Event::LogLine {
+                            msg: format!(
+                                "proxy accept died: {e} >:[ well that was a silent no-op XX"
+                            ),
+                            source: "error".to_string(),
+                            ts: Instant::now(),
+                        });
+                        break; // drops tx; rx closes once live connections finish
+                    }
+                }
+            }
+        });
+
+        // drain every connection's events to the sink as they arrive.
+        for ev in rx {
+            sink(ev);
+        }
+        let _ = acceptor.join();
+        Ok(())
+    }
+
+    /// handle ONE accepted client: dial the upstream, tee both directions to
+    /// completion, return when the connection closes. the testable unit (no
+    /// infinite accept loop). errors are loud events, never panics.
+    ///
+    /// teardown: a clean EOF half-closes only (so e.g. an HTTP client that
+    /// `shutdown(Write)` after its request still gets the response); a read/write
+    /// ERROR tears both sockets fully down so the sibling copy thread unblocks and
+    /// nothing leaks. a write that stalls past PROXY_WRITE_TIMEOUT counts as an
+    /// error. (a peer that goes fully idle — no data, no FIN, no error — can still
+    /// hold its two relay threads, but it's isolated to that one connection.)
+    pub fn tee_connection(client: TcpStream, target: &str, sink: &mut dyn FnMut(Event)) {
+        let upstream = match TcpStream::connect(target) {
+            Ok(s) => s,
+            Err(e) => {
+                sink(Event::LogLine {
+                    msg: format!(
+                        "upstream {target} unreachable: {e}. well that was a silent no-op XX >:["
+                    ),
+                    source: "error".to_string(),
+                    ts: Instant::now(),
+                });
+                return;
+            }
+        };
+        // bound a stalled write so a peer that stops reading can't park a thread forever.
+        let _ = client.set_write_timeout(Some(PROXY_WRITE_TIMEOUT));
+        let _ = upstream.set_write_timeout(Some(PROXY_WRITE_TIMEOUT));
+
+        // two readers, one writer-half each, both teeing into one channel so the
+        // sink stays single-threaded. clone gives independent handles to each socket.
+        let (Ok(client_w), Ok(upstream_w)) = (client.try_clone(), upstream.try_clone()) else {
+            sink(Event::LogLine {
+                msg: "couldn't split the sockets for teeing >:[ they ALL talk eventually XX"
+                    .to_string(),
+                source: "error".to_string(),
+                ts: Instant::now(),
+            });
+            return;
+        };
+
+        let (tx, rx) = mpsc::channel::<Event>();
+        let tx_ct = tx.clone();
+        let h_ct =
+            std::thread::spawn(move || copy_tee(client, upstream_w, "client→target", &tx_ct));
+        let tx_tc = tx.clone();
+        let h_tc =
+            std::thread::spawn(move || copy_tee(upstream, client_w, "target→client", &tx_tc));
+        drop(tx);
+
+        for ev in rx {
+            sink(ev);
+        }
+        let _ = h_ct.join();
+        let _ = h_tc.join();
+        sink(Event::LogLine {
+            msg: "proxy connection closed. they ALL talk eventually XX 💀".to_string(),
+            source: "proxy".to_string(),
+            ts: Instant::now(),
+        });
+    }
+}
+
+/// copy bytes from `from` to `to`, teeing each chunk as a CommandOutput event
+/// tagged with the direction. clean EOF half-closes the write side (preserving
+/// the other direction — half-close is legal + needed for request/response). a
+/// read/write ERROR (incl. a stalled-write timeout) means the connection is
+/// broken, so tear BOTH sockets fully down — that unblocks the sibling copy
+/// thread's parked read/write instead of leaking it.
+fn copy_tee(mut from: TcpStream, mut to: TcpStream, dir: &str, tx: &mpsc::Sender<Event>) {
+    let mut buf = [0u8; 4096];
+    let mut errored = false;
+    loop {
+        match from.read(&mut buf) {
+            Ok(0) => break, // clean EOF
+            Err(_) => {
+                errored = true;
+                break;
+            }
+            Ok(n) => {
+                if to.write_all(&buf[..n]).is_err() {
+                    errored = true;
+                    break;
+                }
+                let _ = tx.send(Event::CommandOutput {
+                    line: format!("{dir}: {n}B {}", snippet(&buf[..n])),
+                    stream: dir.to_string(),
+                    ts: Instant::now(),
+                });
             }
         }
-
-        events
+    }
+    if errored {
+        // broken connection: force the whole thing down so the sibling unblocks.
+        let _ = from.shutdown(Shutdown::Both);
+        let _ = to.shutdown(Shutdown::Both);
+    } else {
+        // clean EOF: half-close only, let the other direction finish draining.
+        let _ = to.shutdown(Shutdown::Write);
     }
 }
 
-/// Basic proxy stub for v1 `ghost proxy <addr>`.
-/// Minimal: no actual bind/listen/forward (would require full tokio runtime + loop, blocks tests, YAGNI for v1 command focus).
-/// Just emits banner + simulated connect/response events (as LogLine for now; later Http variants).
-/// Still prints 👻 attached banner. Respects dry_run in text only. Ready to upgrade to real tokio::net::TcpListener + forward that emits on wire events.
-/// No TLS. No mutation.
-#[derive(Debug, Clone)]
-pub struct ProxyStub {
-    pub addr: String,
-}
-
-impl ProxyStub {
-    pub fn new(addr: impl Into<String>) -> Self {
-        Self { addr: addr.into() }
-    }
-
-    pub fn run(&self, dry_run: bool) -> Vec<Event> {
-        let banner = format!(
-            "👻 ghost proxy attached to {} (dry_run={}) (｡◕‿↼) for science",
-            self.addr, dry_run
-        );
-        eprintln!("{}", banner);
-
-        vec![
-            Event::LogLine {
-                msg: banner,
-                source: "interceptor:proxy".to_string(),
-                ts: Instant::now(),
-            },
-            Event::LogLine {
-                msg: "proxy stub: simulated connect from client".to_string(),
-                source: "proxy".to_string(),
-                ts: Instant::now(),
-            },
-            Event::LogLine {
-                msg: "proxy stub: response 200 ok (no real forward yet) >:[ they ALL talk eventually XX".to_string(),
-                source: "proxy".to_string(),
-                ts: Instant::now(),
-            },
-        ]
-    }
+/// short, single-line, utf8-lossy preview of a wire chunk (not the raw bytes).
+fn snippet(bytes: &[u8]) -> String {
+    let s = String::from_utf8_lossy(bytes);
+    let one_line: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(80)
+        .collect();
+    one_line.trim().to_string()
 }
 
 #[cfg(test)]
@@ -252,30 +471,6 @@ mod tests {
                 });
             }
             evs
-        }
-    }
-
-    struct ProxyStub {
-        addr: String,
-    }
-    impl ProxyStub {
-        fn new(addr: impl Into<String>) -> Self {
-            Self { addr: addr.into() }
-        }
-        fn run(&self, _dry: bool) -> Vec<Event> {
-            let ts = Instant::now();
-            vec![
-                Event::LogLine {
-                    msg: format!("👻 ghost proxy attached to {} (¬‿¬)", self.addr),
-                    source: "interceptor:proxy".into(),
-                    ts,
-                },
-                Event::LogLine {
-                    msg: "proxy stub connect + simulated response. zero chill detected 💀".into(),
-                    source: "proxy".into(),
-                    ts,
-                },
-            ]
         }
     }
 
@@ -352,22 +547,6 @@ mod tests {
             assert_eq!(source, "interceptor:command");
         }
         // also check stderr print happened (can't easily capture here, verified in binary run later)
-    }
-
-    #[test]
-    fn proxy_stub_emits() {
-        let stub = ProxyStub::new("localhost:12345");
-        let events = stub.run(true);
-        assert!(!events.is_empty());
-        let has_banner = events.iter().any(
-            |e| matches!(e, Event::LogLine { msg, .. } if msg.contains("👻 ghost proxy attached")),
-        );
-        assert!(has_banner, "proxy must emit attached banner event");
-        let has_activity = events.iter().any(|e| matches!(e, Event::LogLine { msg, .. } if msg.contains("proxy stub") || msg.contains("connect") || msg.contains("response")));
-        assert!(
-            has_activity,
-            "proxy stub must emit simulated request/response events"
-        );
     }
 
     #[test]

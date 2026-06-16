@@ -63,8 +63,16 @@ pub enum Commands {
         dry_run: bool,
     },
 
-    /// Proxy a local addr (http-ish or raw for now). Simple tokio backend.
-    Proxy { addr: String },
+    /// Real TCP tee proxy: bind <listen>, forward to <target>, tee both
+    /// directions onto the bus so you can watch a localhost service's traffic
+    /// live. raw byte tee, no TLS, no mutation, local only.
+    /// Example: ghost proxy 127.0.0.1:8080 127.0.0.1:3000
+    Proxy {
+        /// addr ghost binds and listens on (e.g. 127.0.0.1:8080)
+        listen: String,
+        /// upstream addr ghost forwards to (e.g. 127.0.0.1:3000)
+        target: String,
+    },
 
     /// Run from a full config file (toml). headless or tui depending on flags.
     /// batch over targets in config if present.
@@ -101,6 +109,26 @@ pub enum Commands {
         /// undo: remove the ghost bridge hook from settings.json
         #[arg(long, default_value_t = false)]
         uninstall: bool,
+    },
+
+    /// Watch your live agent THROUGH the bridge. tails the structured feed
+    /// (~/.ghost/events.jsonl) that `ghost hook` writes on every tool call and
+    /// drives the ghost face in real time — side-eye on passes, full 💀 on
+    /// blocks. the loud live view the bridge always deserved. 👻
+    /// (run `ghost install` first so the bridge is actually feeding it.)
+    Watch {
+        /// explicit feed path (default ~/.ghost/events.jsonl)
+        #[arg(long)]
+        path: Option<String>,
+    },
+
+    /// What has your agent been TRYING? reads the bridge feed
+    /// (~/.ghost/events.jsonl) and tells you what sentinel kept blocking — by
+    /// category, by tool, and the exact commands it retried. the receipts. 👻
+    Blocks {
+        /// explicit feed path (default ~/.ghost/events.jsonl)
+        #[arg(long)]
+        path: Option<String>,
     },
 
     /// List available gadgets with your voice descriptions + hotkeys.

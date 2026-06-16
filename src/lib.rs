@@ -16,11 +16,12 @@ pub mod interceptor;
 pub mod personality;
 pub mod session;
 pub mod tui;
+pub mod watchlog;
 
 // Re-exports for convenience at the top level.
 pub use event::{Event, GhostFaceState, PersonalityHint};
 pub use gadgets::Gadget;
-pub use interceptor::{CommandWrapper, ProxyStub};
+pub use interceptor::{CommandWrapper, TcpTeeProxy};
 pub use personality::PersonalityEngine;
 pub use session::{Session, SessionMetrics};
 

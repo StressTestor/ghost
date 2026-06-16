@@ -10,17 +10,19 @@ i built this because watching tool calls in logs is soul-crushing. wanted a loud
 
 ```
 ghost attach ./my-agent --gadgets poke,roast --dry-run
-# or
-ghost proxy localhost:8080
+# or tee a localhost service (real TCP proxy: listen -> target)
+ghost proxy 127.0.0.1:8080 127.0.0.1:3000
 ```
 
-terminal flips to dense spooky tui. the ghost face 👻 reacts live: side-eyes on sketchy calls, (¬‿¬) on good roasts, >:[ on silent no-ops.
+terminal flips to dense spooky tui. the ghost face 👻 reacts: side-eyes on sketchy calls, (¬‿¬) on good roasts, >:[ on silent no-ops.
 
-live activity scrolls real events (tool calls, responses, command output) with glitch + color. your comments in the stream: "this agent has zero chill 💀", "recursive gaslighting as a service", blunt + sharp.
+the face reacting LIVE to a real session is `ghost watch` (it tails the bridge feed). `attach` streams output live in headless; its tui opens on the captured trace once the command's done.
+
+activity scrolls real events (tool calls, responses, command output) with glitch + color. your comments in the stream: "this agent has zero chill 💀", "recursive gaslighting as a service", blunt + sharp.
 
 hit a key and a gadget fires: screen glitches, face goes party mode, while it actually mutates/drops/delays the stream (or just observes).
 
-leaves session traces with personality baked in. replay later. feed to your evals.
+leaves session traces with personality baked in. replay later. and a structured `.jsonl` trace (one event per line, seq + timing) you can actually feed to your evals.
 
 feels like having @ThatbV living in your tmux pane, professionally distrustful until something admits the vuln.
 
@@ -36,8 +38,8 @@ cargo build --release
 # list gadgets (voice descriptions included)
 ./target/release/ghost gadgets
 
-# attach a real thing (stub tui for now)
-./target/release/ghost attach ./your-agent --dry-run
+# attach a thing (headless streams live; the tui opens on the captured trace)
+./target/release/ghost --headless attach ./your-agent --dry-run
 
 # or just play
 cargo run -- gadgets
@@ -71,25 +73,55 @@ ghost is offense bolted onto defense, never a way around it:
 
 the roasts vary per block category (cred-access, pipe-to-shell, destructive, persistence, exfil) and are loud as hell. uninstall with `ghost install --uninstall`. full design in `docs/superpowers/specs/2026-06-14-ghost-sentinel-bridge-design.md`.
 
+### watch it live
+
+the bridge runs headless, but it also writes a structured feed: every tool call (block or pass) lands in `~/.ghost/events.jsonl`. `ghost watch` tails that feed and reacts in real time.
+
+```bash
+ghost watch              # spooky tui. face side-eyes passes, goes full 💀 on blocks
+ghost --headless watch   # tail -f for the feed, every call in voice
+```
+
+so it's not "read the logs later". the ghost face reacts to your actual session as it happens. blocks drop their roast straight into the activity stream.
+
+want the receipts instead of the live show? `ghost blocks` reads the same feed and tells you what your agent kept reaching for - by category, by tool, and the exact commands it retried (with an "AGAIN??" on the repeats).
+
+```bash
+ghost blocks
+#   tool calls seen: 142 | blocked by sentinel: 7
+#   --- by category ---
+#     cred-access: 4 💀
+#     pipe-to-shell: 3 💀
+#   --- what it kept trying ---
+#     3x  <the thing it would not stop doing> (AGAIN??)
+```
+
 ## example `ghost --help`
 
 ```
 ghost 👻
 live visibility + deliberate chaos for your agents, commands, localhost. complements sentinel. they ALL talk eventually XX
 
-Usage: ghost <COMMAND>
+Usage: ghost [OPTIONS] <COMMAND>
 
 Commands:
-  attach   Attach to a command / agent process (wrapper + capture).
-  proxy    Proxy a local addr (http-ish or raw for now). Simple tokio backend.
-  run      Run from a full config file (toml). headless or tui depending on flags.
-  replay   Replay a previous session recording (text + face states + roasts).
-  gadgets  List available gadgets with your voice descriptions + hotkeys.
+  attach   Attach to a command / agent process (wrapper + live capture)
+  proxy    Real TCP tee proxy: bind <listen>, forward to <target>, tee both ways
+  run      Run from a full config file (toml)
+  replay   Replay a previous session recording (.txt voice, or structured .jsonl)
+  hook     PreToolUse bridge: run offense, defer to sentinel, narrate the verdict
+  install  Wire the ghost↔sentinel bridge into ~/.claude/settings.json
+  watch    Tail the bridge feed live and drive the ghost face in real time
+  blocks   What your agent kept trying: blocks by category / tool / command
+  gadgets  List available gadgets with your voice descriptions + hotkeys
+  config   Inspect ghost config (toml)
   help     Print this message or the help of the given subcommand(s)
 
 Options:
-  -h, --help     Print help
-  -V, --version  Print version
+      --headless        text only output with full voice. auto if no tty
+      --config <CONFIG> path to ghost config toml for gadgets/voice/targets
+  -h, --help            Print help
+  -V, --version         Print version
 ```
 
 (the long about points at the spec. no corporate fluff.)
@@ -99,10 +131,11 @@ Options:
 in:
 - `ghost` binary, clap subcommands (attach, proxy, run, replay, gadgets, config path)
 - ratatui tui with live ghost face (4-6 expressions), activity, gadget bar, status strip, personality log
-- 5-7 core gadgets with dry-run real effects on command wrapper + basic proxy (stubs + a couple working in skeleton)
+- 5-7 core gadgets with dry-run real effects on the command wrapper
+- real TCP tee proxy (binds, forwards, tees both directions; no TLS)
 - interception for cli + simple agent streams
 - toml config (gadgets, voice, targets)
-- session recording + replay (basic)
+- session recording (voice .txt + structured .jsonl you can feed to evals) + replay
 - headless mode with roasts + json artifacts
 - safety: dry run default, banners, scoping
 - tests (unit for gadgets/personality, structure tests)
@@ -123,9 +156,11 @@ full details + gadget catalog + exact voice examples: `docs/superpowers/specs/20
 
 ```
 ghost attach <command...> [--gadgets poke,roast] [--dry-run]
-ghost proxy <addr>
+ghost proxy <listen> <target>       # real TCP tee proxy: forward listen -> target, watch both ways
 ghost run --config my-chaos.toml
 ghost replay <session-id>
+ghost watch [--path <feed.jsonl>]    # tail the bridge feed live, face reacts in real time
+ghost blocks [--path <feed.jsonl>]   # what your agent kept trying: blocks by category/tool/command
 ghost gadgets
 ghost install --sentinel <path>      # wire the bridge into claude code (wraps sentinel)
 ghost hook --sentinel <path>         # the per-call bridge (claude code invokes this)
@@ -172,7 +207,7 @@ update ARCHITECTURE.md on any structural change (new modules, deps, etc).
 
 ## status
 
-v1 is real: interception, 7 gadgets, full tui, headless, config, recording, and the sentinel bridge (`ghost hook` / `ghost install`) verified end-to-end against the real sentinel binary. 63 tests, clippy + fmt clean.
+v1 is real: streaming interception, real TCP tee proxy, 7 gadgets, full tui, headless, config, structured + voice recordings, the sentinel bridge (`ghost hook` / `ghost install`) verified end-to-end against the real sentinel binary, and the live `ghost watch` / `ghost blocks` views off the bridge feed. 85 tests, clippy + fmt clean.
 
 built because the space needed a loud offensive counterpart to the defensive tooling. for science lmao.
 

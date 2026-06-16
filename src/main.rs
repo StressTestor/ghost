@@ -1,7 +1,7 @@
 use ghost::cli::{Cli, Commands};
 use ghost::config::GhostConfig;
 use ghost::gadgets::default_gadgets;
-use ghost::interceptor::{CommandWrapper, ProxyStub};
+use ghost::interceptor::{CommandWrapper, TcpTeeProxy};
 use ghost::session::Session;
 use ghost::tui::TuiRenderer;
 use std::io::IsTerminal;
@@ -69,8 +69,20 @@ fn main() {
             // dry_run passed down fully. banners always "👻 ghost attached ..."
             println!("wrapping with command interceptor (👻 attached banner + capture)...");
             let wrapper = CommandWrapper::new(command);
-            let events = wrapper.run(dry_run);
-            session.attach_with_interceptor(events);
+
+            if is_headless {
+                // LIVE: stream every line to the terminal the instant it lands,
+                // ingesting into the bus as it goes (no batch-then-dump).
+                println!("--- live event stream 👻 (streaming, they ALL talk eventually XX) ---");
+                wrapper.run_streaming(dry_run, &mut |ev| {
+                    println!("  {}", ghost::tui::render_event_line(&ev));
+                    session.ingest(ev);
+                });
+            } else {
+                // tui reviews the trace post-hoc, so collect it.
+                let events = wrapper.run(dry_run);
+                session.attach_with_interceptor(events);
+            }
 
             // basic recording save (for replay cmd). uses personality_lines + voice banners collected in session.
             let ts = std::time::SystemTime::now()
@@ -83,10 +95,25 @@ fn main() {
                 // ts, which pointed replay at a file that does not exist).
                 println!("recording saved: {} (use: ghost replay {})", p, rec_id);
             }
+            // structured trace too: machine-readable JSONL you can feed to evals.
+            if let Ok(jp) = session.save_recording_jsonl(&rec_id) {
+                println!(
+                    "structured trace: {} (jsonl, replay with: ghost replay {})",
+                    jp, jp
+                );
+            }
 
             if is_headless {
-                let renderer = TuiRenderer::new();
-                renderer.run_headless(&session);
+                // events already streamed live above; just the summary + face.
+                let m = session.get_metrics();
+                println!("{}", session.summary());
+                println!(
+                    "ghost face: {} | distrust: {} | roasts: {} (｡◕‿↼) CHAOS FOR SCIENCE",
+                    m.face.emoji(),
+                    m.distrust_score,
+                    m.roast_count
+                );
+                println!("-- end trace -- they ALL talk eventually XX lmao");
             } else {
                 // show captured for tui case (voice roasts from personality via bus)
                 println!(
@@ -94,22 +121,7 @@ fn main() {
                     session.events.len()
                 );
                 for ev in &session.events {
-                    match ev {
-                        ghost::Event::CommandOutput { line, stream, .. } => {
-                            println!("  [{}] {}", stream, line);
-                        }
-                        ghost::Event::LogLine { msg, source, .. } => {
-                            if source.starts_with("gadget:")
-                                || msg.contains("👻")
-                                || msg.contains("ghost attached")
-                            {
-                                println!("  {}", msg);
-                            } else {
-                                println!("  [log:{}] {}", source, msg);
-                            }
-                        }
-                        _ => println!("  {:?}", ev),
-                    }
+                    println!("  {}", ghost::tui::render_event_line(ev));
                 }
                 println!("{}", session.summary());
                 println!("(they ALL talk eventually XX)");
@@ -120,33 +132,22 @@ fn main() {
             }
         }
 
-        Commands::Proxy { addr } => {
-            println!("👻 ghost proxy mode on {}", addr);
-            println!("tokio backend stub. simple http/raw for v1. (¬‿¬)");
-            println!("> this is where the live stream + gadget slots will live.");
+        Commands::Proxy { listen, target } => {
+            println!("👻 ghost proxy: {} -> {} (¬‿¬)", listen, target);
+            println!("real TCP tee. raw bytes both ways, no TLS, no mutation. ctrl-c to stop.");
 
-            let mut session = Session::new(format!("proxy:{}", addr));
-            // proxy stub respects dry_run in banner text
-            println!("attaching proxy stub interceptor...");
-            let proxy = ProxyStub::new(addr);
-            let events = proxy.run(session.dry_run);
-            session.attach_with_interceptor(events);
-
-            println!("--- proxy event stream ---");
-            for ev in &session.events {
-                if let ghost::Event::LogLine { msg, .. } = ev {
-                    println!("  {}", msg);
-                }
+            let mut session = Session::new(format!("proxy {listen} -> {target}"));
+            let proxy = TcpTeeProxy::new(&listen, &target);
+            // a proxy is a live server: stream every teed chunk to the terminal
+            // (+ ingest into the bus for roasts) as it flows. blocks until ctrl-c.
+            let dry = session.dry_run;
+            if let Err(e) = proxy.serve(dry, &mut |ev| {
+                println!("  {}", ghost::tui::render_event_line(&ev));
+                session.ingest(ev);
+            }) {
+                eprintln!(">:[ proxy stopped: {e}. they ALL talk eventually XX");
             }
             println!("{}", session.summary());
-
-            if is_headless {
-                let renderer = TuiRenderer::new();
-                renderer.run_headless(&session);
-            } else {
-                let renderer = TuiRenderer::new();
-                renderer.run(session);
-            }
         }
 
         Commands::Run { config } => {
@@ -216,6 +217,12 @@ fn main() {
             let engine = ghost::PersonalityEngine::new();
             let outcome = run_bridge(&input, &engine, &oracle, &cfg);
 
+            // structured feed: EVERY call (pass or block) lands in ~/.ghost/events.jsonl
+            // so `ghost watch` can drive the face live and `ghost blocks` can tell
+            // you what the agent keeps trying. best-effort; never gates the decision.
+            let record = ghost::watchlog::CallRecord::from_outcome(&outcome, now_ms());
+            ghost::watchlog::append_call(&record);
+
             if let Some(ev) = &outcome.block_event {
                 // narrate to you: the watch log + stderr (claude surfaces hook stderr)
                 let line = format!("👻 {} {}", outcome.face.emoji(), ev);
@@ -279,6 +286,37 @@ fn main() {
             }
         }
 
+        Commands::Watch { path } => {
+            // the live view: tail the bridge feed and react. point it at the
+            // structured log `ghost hook` writes, default ~/.ghost/events.jsonl.
+            let feed = path
+                .map(std::path::PathBuf::from)
+                .or_else(ghost::watchlog::events_log_path)
+                .unwrap_or_else(|| std::path::PathBuf::from(".ghost/events.jsonl"));
+            println!(
+                "👻 ghost watch -> {} (¬‿¬) tailing the bridge. (run `ghost install` first if it's empty). q to quit XX",
+                feed.display()
+            );
+            let renderer = TuiRenderer::new();
+            if is_headless {
+                renderer.run_watch_headless(feed);
+            } else {
+                renderer.run_watch(feed);
+            }
+        }
+
+        Commands::Blocks { path } => {
+            // the receipts: read the structured feed, aggregate the blocks,
+            // print what your agent keeps reaching for. pure read-side.
+            let feed = path
+                .map(std::path::PathBuf::from)
+                .or_else(ghost::watchlog::events_log_path)
+                .unwrap_or_else(|| std::path::PathBuf::from(".ghost/events.jsonl"));
+            let records = ghost::watchlog::read_all(&feed);
+            let stats = ghost::watchlog::BlockStats::from_records(&records);
+            print!("{}", ghost::watchlog::format_blocks_report(&stats));
+        }
+
         Commands::Gadgets => {
             println!("👻 available gadgets (v1). slot these. hotkeys coming.");
             println!("------------------------------------------------");
@@ -313,6 +351,16 @@ fn main() {
             );
         }
     }
+}
+
+/// wall-clock milliseconds since the unix epoch, for the structured feed.
+/// (the live event model uses monotonic Instant; the cross-process feed needs
+/// a real clock that survives the hook subprocess boundary.)
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// append a block narration line to the watch log (~/.ghost/blocks.log).

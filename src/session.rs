@@ -1,4 +1,4 @@
-use crate::event::{Event, GhostFaceState};
+use crate::event::{Event, GhostFaceState, RecordedEvent};
 use crate::gadgets::{Gadget, default_gadgets};
 use crate::personality::PersonalityEngine;
 
@@ -154,10 +154,12 @@ impl Session {
     }
 
     /// basic recording: save personality_lines (roasts + banners in exact voice) + fallback events to txt file.
-    /// id used for filename ghost-recording-<id>.txt . returns path for replay cmd + print.
+    /// id used for filename ghost-recording-<id>.txt . returns the full path for replay cmd + print.
     /// called after attach/proxy/run exit. simple, no new deps.
     pub fn save_recording(&self, id: &str) -> std::io::Result<String> {
-        let path = format!("ghost-recording-{}.txt", id);
+        let dir = recordings_dir();
+        ensure_private_dir(&dir)?;
+        let path = dir.join(format!("ghost-recording-{}.txt", id));
         let content = if !self.personality_lines.is_empty() {
             self.personality_lines.join("\n")
         } else {
@@ -187,8 +189,64 @@ impl Session {
                 .join("\n")
         };
         std::fs::write(&path, &content)?;
-        Ok(path)
+        Ok(path.display().to_string())
     }
+
+    /// project the live events into their serializable form (recording t=0 at
+    /// the first event, so relative timing survives the Instant->disk gap).
+    pub fn to_recorded_events(&self) -> Vec<RecordedEvent> {
+        let Some(first) = self.events.first() else {
+            return Vec::new();
+        };
+        let first_ts = first.ts();
+        self.events
+            .iter()
+            .enumerate()
+            .map(|(i, e)| RecordedEvent::from_event(e, i, first_ts))
+            .collect()
+    }
+
+    /// STRUCTURED recording: one RecordedEvent per line (JSONL). unlike the voice
+    /// .txt (which is for replay vibes), this is a real machine-readable trace —
+    /// the thing the README means by "feed to your evals". returns the path.
+    pub fn save_recording_jsonl(&self, id: &str) -> std::io::Result<String> {
+        let dir = recordings_dir();
+        ensure_private_dir(&dir)?;
+        let path = dir.join(format!("ghost-recording-{}.jsonl", id));
+        let body = self
+            .to_recorded_events()
+            .iter()
+            .map(|r| r.to_jsonl())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, body)?;
+        Ok(path.display().to_string())
+    }
+}
+
+/// where recordings live: `~/.ghost/recordings`, falling back to the cwd only if
+/// there's no HOME. recordings (esp. the .jsonl) capture RAW command output, so
+/// they belong in ghost's private dir, NOT in whatever repo you ran `attach`
+/// from. does not create the dir — see `ensure_private_dir`.
+pub fn recordings_dir() -> std::path::PathBuf {
+    match std::env::var_os("HOME") {
+        Some(home) => std::path::Path::new(&home)
+            .join(".ghost")
+            .join("recordings"),
+        None => std::path::PathBuf::from("."),
+    }
+}
+
+/// create `dir` (recursively) and lock it to the owner (0700 on unix) since it
+/// holds captured command output. perms are best-effort.
+fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(())
 }
 
 /// Simple metrics struct for get_metrics (v1 bus visibility, no overengineer).
@@ -243,6 +301,51 @@ mod tests {
             crate::event::GhostFaceState::Neutral,
             "face should react"
         );
+    }
+
+    #[test]
+    fn save_recording_jsonl_writes_a_parseable_structured_trace() {
+        use crate::event::RecordedEvent;
+        let mut s = Session::new("jsonl-rec");
+        s.ingest(Event::ToolCall {
+            name: "Read".into(),
+            args: "{}".into(),
+            ts: Instant::now(),
+        });
+        s.ingest(Event::Response {
+            body: "ok".into(),
+            status: Some(200),
+            ts: Instant::now(),
+        });
+
+        let path = s
+            .save_recording_jsonl("unit-jsonl-1781400000")
+            .expect("write jsonl");
+        let content = std::fs::read_to_string(&path).expect("read back");
+        let recs: Vec<RecordedEvent> = content
+            .lines()
+            .filter_map(RecordedEvent::from_jsonl)
+            .collect();
+
+        // every event projected, one per line, in order, all parseable
+        assert_eq!(
+            recs.len(),
+            s.events.len(),
+            "one structured record per live event"
+        );
+        assert!(recs.len() >= 2);
+        // seq is sequential from 0
+        for (i, r) in recs.iter().enumerate() {
+            let seq = match r {
+                RecordedEvent::ToolCall { seq, .. }
+                | RecordedEvent::Response { seq, .. }
+                | RecordedEvent::CommandOutput { seq, .. }
+                | RecordedEvent::Log { seq, .. } => *seq,
+            };
+            assert_eq!(seq, i, "seq must match position");
+        }
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
