@@ -82,6 +82,18 @@ ghost --headless watch   # tail -f for the feed, every call in voice
 
 so it's not "read the logs later". the ghost face reacts to your actual session as it happens. blocks drop their roast straight into the activity stream.
 
+want the receipts instead of the live show? `ghost blocks` reads the same feed and tells you what your agent kept reaching for - by category, by tool, and the exact commands it retried (with an "AGAIN??" on the repeats).
+
+```bash
+ghost blocks
+#   tool calls seen: 142 | blocked by sentinel: 7
+#   --- by category ---
+#     cred-access: 4 💀
+#     pipe-to-shell: 3 💀
+#   --- what it kept trying ---
+#     3x  <the thing it would not stop doing> (AGAIN??)
+```
+
 ## example `ghost --help`
 
 ```
@@ -138,6 +150,7 @@ ghost proxy <addr>
 ghost run --config my-chaos.toml
 ghost replay <session-id>
 ghost watch [--path <feed.jsonl>]    # tail the bridge feed live, face reacts in real time
+ghost blocks [--path <feed.jsonl>]   # what your agent kept trying: blocks by category/tool/command
 ghost gadgets
 ghost install --sentinel <path>      # wire the bridge into claude code (wraps sentinel)
 ghost hook --sentinel <path>         # the per-call bridge (claude code invokes this)

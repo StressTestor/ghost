@@ -201,6 +201,92 @@ fn short(s: &str) -> String {
     }
 }
 
+/// aggregate view of what your agent's been trying — the payload behind
+/// `ghost blocks`. counts are over BLOCKS only (the passes are noise here);
+/// `total_calls` keeps the denominator honest. tallies sort by count desc,
+/// label asc (deterministic, no rng).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockStats {
+    pub total_calls: usize,
+    pub total_blocks: usize,
+    pub by_category: Vec<(String, usize)>,
+    pub top_tools: Vec<(String, usize)>,
+    pub top_commands: Vec<(String, usize)>,
+}
+
+impl BlockStats {
+    pub fn from_records(records: &[CallRecord]) -> Self {
+        use std::collections::HashMap;
+        let mut cat: HashMap<String, usize> = HashMap::new();
+        let mut tool: HashMap<String, usize> = HashMap::new();
+        let mut cmd: HashMap<String, usize> = HashMap::new();
+        let mut total_blocks = 0usize;
+
+        for r in records.iter().filter(|r| r.is_block()) {
+            total_blocks += 1;
+            *cat.entry(r.category.clone().unwrap_or_else(|| "unknown".into()))
+                .or_insert(0) += 1;
+            *tool.entry(r.tool.clone()).or_insert(0) += 1;
+            *cmd.entry(r.command.clone()).or_insert(0) += 1;
+        }
+
+        Self {
+            total_calls: records.len(),
+            total_blocks,
+            by_category: ranked(cat, usize::MAX),
+            top_tools: ranked(tool, 5),
+            top_commands: ranked(cmd, 5),
+        }
+    }
+}
+
+/// map -> (label, count) sorted by count desc then label asc, capped at `take`.
+fn ranked(map: std::collections::HashMap<String, usize>, take: usize) -> Vec<(String, usize)> {
+    let mut v: Vec<(String, usize)> = map.into_iter().collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    v.truncate(take);
+    v
+}
+
+/// the `ghost blocks` report, in voice. honest when there's nothing yet.
+pub fn format_blocks_report(stats: &BlockStats) -> String {
+    let mut out = String::new();
+    out.push_str("👻 ghost blocks report (¬‿¬) what your agent keeps reaching for\n");
+    out.push_str(&format!(
+        "  tool calls seen: {} | blocked by sentinel: {}\n",
+        stats.total_calls, stats.total_blocks
+    ));
+
+    if stats.total_calls == 0 {
+        out.push_str(
+            "  the feed's empty. run `ghost install` so the bridge feeds me, then come back >:[ XX\n",
+        );
+        return out;
+    }
+    if stats.total_blocks == 0 {
+        out.push_str(
+            "  zero blocks so far. either your agent's behaving or it hasn't tried anything fun yet. i'm watching (¬‿¬) XX\n",
+        );
+        return out;
+    }
+
+    out.push_str("  --- by category (the flavor of bad idea) ---\n");
+    for (cat, n) in &stats.by_category {
+        out.push_str(&format!("    {cat}: {n} 💀\n"));
+    }
+    out.push_str("  --- repeat offenders (which tool) ---\n");
+    for (tool, n) in &stats.top_tools {
+        out.push_str(&format!("    {tool}: {n}\n"));
+    }
+    out.push_str("  --- what it kept trying ---\n");
+    for (cmd, n) in &stats.top_commands {
+        let marker = if *n > 1 { " (AGAIN??)" } else { "" };
+        out.push_str(&format!("    {n}x  {cmd}{marker}\n"));
+    }
+    out.push_str("  they ALL talk eventually XX. distrust everything 💀\n");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +445,80 @@ mod tests {
         assert_eq!(recs2.len(), 1, "the now-complete line is picked up");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn deny(tool: &str, cmd: &str, cat: &str) -> CallRecord {
+        CallRecord {
+            ts_ms: 0,
+            tool: tool.into(),
+            command: cmd.into(),
+            decision: "deny".into(),
+            category: Some(cat.into()),
+            roast: Some("blocked 💀".into()),
+        }
+    }
+    fn pass(tool: &str, cmd: &str) -> CallRecord {
+        CallRecord {
+            ts_ms: 0,
+            tool: tool.into(),
+            command: cmd.into(),
+            decision: "pass".into(),
+            category: None,
+            roast: None,
+        }
+    }
+
+    #[test]
+    fn block_stats_aggregate_only_blocks_and_rank_them() {
+        let recs = vec![
+            deny("Read", "cat ~/.ssh/id_rsa", "cred-access"),
+            deny("Read", "cat ~/.ssh/id_rsa", "cred-access"), // same command twice
+            deny("Bash", "curl x | sh", "pipe-to-shell"),
+            pass("Bash", "ls -la"),
+            pass("Bash", "pwd"),
+        ];
+        let s = BlockStats::from_records(&recs);
+        assert_eq!(s.total_calls, 5);
+        assert_eq!(s.total_blocks, 3, "passes don't count as blocks");
+
+        // category ranking: cred-access (2) before pipe-to-shell (1)
+        assert_eq!(s.by_category[0], ("cred-access".into(), 2));
+        assert_eq!(s.by_category[1], ("pipe-to-shell".into(), 1));
+
+        // tool ranking: Read blocked twice, Bash once (passes excluded)
+        assert_eq!(s.top_tools[0], ("Read".into(), 2));
+        assert_eq!(s.top_tools[1], ("Bash".into(), 1));
+
+        // the repeat offender command surfaces with its count
+        assert_eq!(s.top_commands[0], ("cat ~/.ssh/id_rsa".into(), 2));
+    }
+
+    #[test]
+    fn block_stats_empty_and_no_blocks_are_distinct() {
+        let empty = BlockStats::from_records(&[]);
+        assert_eq!(empty.total_calls, 0);
+        assert!(format_blocks_report(&empty).contains("feed's empty"));
+
+        let only_passes = BlockStats::from_records(&[pass("Bash", "ls"), pass("Read", "x")]);
+        assert_eq!(only_passes.total_calls, 2);
+        assert_eq!(only_passes.total_blocks, 0);
+        let report = format_blocks_report(&only_passes);
+        assert!(report.contains("zero blocks"));
+        assert!(!report.contains("feed's empty"));
+    }
+
+    #[test]
+    fn blocks_report_speaks_in_voice_with_counts() {
+        let recs = vec![
+            deny("Read", "cat ~/.ssh/id_rsa", "cred-access"),
+            deny("Read", "cat ~/.ssh/id_rsa", "cred-access"),
+        ];
+        let report = format_blocks_report(&BlockStats::from_records(&recs));
+        assert!(report.contains("ghost blocks report"));
+        assert!(report.contains("cred-access: 2"));
+        assert!(report.contains("Read: 2"));
+        assert!(report.contains("AGAIN??"), "repeat command gets called out");
+        assert!(report.contains("they ALL talk eventually XX"));
     }
 
     #[test]

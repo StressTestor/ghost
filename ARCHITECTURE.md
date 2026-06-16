@@ -51,7 +51,7 @@ ghost/
 │   ├── event.rs         # Event enum + PersonalityHint (core data model)
 │   ├── interceptor.rs   # attachment backends (real v1: CommandWrapper using std::process for exec/capture of CommandOutput, ProxyStub). emits pure Events only. banners + dry_run safety. no gadgets/mutation here.
 │   ├── session.rs       # owns live run, ingests events (core bus), applies gadgets, tracks roasts/mutations/distrust/face. attach_with_interceptor(events) wires wrapper output. SessionMetrics for visibility.
-│   ├── watchlog.rs      # the bridge↔live-view pipe. CallRecord (serde JSONL) appended to ~/.ghost/events.jsonl on every bridged call; read_all/read_from (byte-offset tail) + format_watch_line. pure (de)serialize/format, fs binding thin. feeds `ghost watch` + `ghost blocks`.
+│   ├── watchlog.rs      # the bridge↔live-view pipe. CallRecord (serde JSONL) appended to ~/.ghost/events.jsonl on every bridged call; read_all/read_from (byte-offset tail) + format_watch_line; BlockStats::from_records + format_blocks_report (count desc/label asc, deterministic). pure (de)serialize/format/stats, fs binding thin. feeds `ghost watch` + `ghost blocks`.
 │   ├── personality.rs   # roast engine. single source of @ThatbV voice. kaomoji, blunt, "zero chill"
 │   ├── gadgets/
 │   │   └── mod.rs       # Gadget trait + stubs (PokeGadget, RoastGadget) + registry. apply returns hint
@@ -157,6 +157,10 @@ echo '{"tool_name":"Bash","tool_input":{"command":"ls"}}' | cargo run -- hook --
 cargo run -- watch                       # tui: tail ~/.ghost/events.jsonl, face reacts live (q quits)
 cargo run -- --headless watch            # tail -f in voice (every tool call, live)
 cargo run -- watch --path /tmp/feed.jsonl  # explicit feed path
+
+# the receipts (what your agent kept trying, aggregated from the feed)
+cargo run -- blocks                      # report: blocks by category + tool + the exact retried commands
+cargo run -- blocks --path /tmp/feed.jsonl
 
 # test (tdd style, run often)
 cargo test

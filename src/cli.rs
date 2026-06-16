@@ -114,6 +114,15 @@ pub enum Commands {
         path: Option<String>,
     },
 
+    /// What has your agent been TRYING? reads the bridge feed
+    /// (~/.ghost/events.jsonl) and tells you what sentinel kept blocking — by
+    /// category, by tool, and the exact commands it retried. the receipts. 👻
+    Blocks {
+        /// explicit feed path (default ~/.ghost/events.jsonl)
+        #[arg(long)]
+        path: Option<String>,
+    },
+
     /// List available gadgets with your voice descriptions + hotkeys.
     Gadgets,
 

@@ -309,6 +309,18 @@ fn main() {
             }
         }
 
+        Commands::Blocks { path } => {
+            // the receipts: read the structured feed, aggregate the blocks,
+            // print what your agent keeps reaching for. pure read-side.
+            let feed = path
+                .map(std::path::PathBuf::from)
+                .or_else(ghost::watchlog::events_log_path)
+                .unwrap_or_else(|| std::path::PathBuf::from(".ghost/events.jsonl"));
+            let records = ghost::watchlog::read_all(&feed);
+            let stats = ghost::watchlog::BlockStats::from_records(&records);
+            print!("{}", ghost::watchlog::format_blocks_report(&stats));
+        }
+
         Commands::Gadgets => {
             println!("👻 available gadgets (v1). slot these. hotkeys coming.");
             println!("------------------------------------------------");
