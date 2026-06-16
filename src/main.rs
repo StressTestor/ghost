@@ -216,6 +216,12 @@ fn main() {
             let engine = ghost::PersonalityEngine::new();
             let outcome = run_bridge(&input, &engine, &oracle, &cfg);
 
+            // structured feed: EVERY call (pass or block) lands in ~/.ghost/events.jsonl
+            // so `ghost watch` can drive the face live and `ghost blocks` can tell
+            // you what the agent keeps trying. best-effort; never gates the decision.
+            let record = ghost::watchlog::CallRecord::from_outcome(&outcome, now_ms());
+            ghost::watchlog::append_call(&record);
+
             if let Some(ev) = &outcome.block_event {
                 // narrate to you: the watch log + stderr (claude surfaces hook stderr)
                 let line = format!("👻 {} {}", outcome.face.emoji(), ev);
@@ -279,6 +285,25 @@ fn main() {
             }
         }
 
+        Commands::Watch { path } => {
+            // the live view: tail the bridge feed and react. point it at the
+            // structured log `ghost hook` writes, default ~/.ghost/events.jsonl.
+            let feed = path
+                .map(std::path::PathBuf::from)
+                .or_else(ghost::watchlog::events_log_path)
+                .unwrap_or_else(|| std::path::PathBuf::from(".ghost/events.jsonl"));
+            println!(
+                "👻 ghost watch -> {} (¬‿¬) tailing the bridge. (run `ghost install` first if it's empty). q to quit XX",
+                feed.display()
+            );
+            let renderer = TuiRenderer::new();
+            if is_headless {
+                renderer.run_watch_headless(feed);
+            } else {
+                renderer.run_watch(feed);
+            }
+        }
+
         Commands::Gadgets => {
             println!("👻 available gadgets (v1). slot these. hotkeys coming.");
             println!("------------------------------------------------");
@@ -313,6 +338,16 @@ fn main() {
             );
         }
     }
+}
+
+/// wall-clock milliseconds since the unix epoch, for the structured feed.
+/// (the live event model uses monotonic Instant; the cross-process feed needs
+/// a real clock that survives the hook subprocess boundary.)
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// append a block narration line to the watch log (~/.ghost/blocks.log).

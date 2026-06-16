@@ -103,6 +103,17 @@ pub enum Commands {
         uninstall: bool,
     },
 
+    /// Watch your live agent THROUGH the bridge. tails the structured feed
+    /// (~/.ghost/events.jsonl) that `ghost hook` writes on every tool call and
+    /// drives the ghost face in real time — side-eye on passes, full 💀 on
+    /// blocks. the loud live view the bridge always deserved. 👻
+    /// (run `ghost install` first so the bridge is actually feeding it.)
+    Watch {
+        /// explicit feed path (default ~/.ghost/events.jsonl)
+        #[arg(long)]
+        path: Option<String>,
+    },
+
     /// List available gadgets with your voice descriptions + hotkeys.
     Gadgets,
 

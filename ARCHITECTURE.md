@@ -2,7 +2,9 @@
 
 **ghost** 👻 cli + tui for live visibility + deliberate chaos injection into real agent tool calls, cli commands, local services. offensive research counterpart to sentinel. "they ALL talk eventually XX"
 
-last updated: 2026-06-14 (ghost↔sentinel bridge added: src/bridge.rs + `ghost hook`/`ghost install` subcommands. ghost is now a PreToolUse middleware that wraps sentinel — runs offense, defers to sentinel's policy, narrates blocks in voice (varied kaomoji roasts per BlockCategory), grafts the roast into the deny reason the agent sees + logs it to ~/.ghost/blocks.log. never downgrades a deny, never auto-allows, fails closed. verified end-to-end against the real sentinel binary. 63 tests, clippy --all-targets/fmt clean. spec: docs/superpowers/specs/2026-06-14-ghost-sentinel-bridge-design.md)
+last updated: 2026-06-16 (live watch added: src/watchlog.rs + `ghost watch` subcommand. the bridge now appends a structured `CallRecord` per tool call to ~/.ghost/events.jsonl; `ghost watch` tails it and drives the ghost face live off your real claude code session. closes the gap where the reacting face had no real tool calls to react to. BridgeOutcome carries tool/command/category for the feed.)
+
+prior: 2026-06-14 (ghost↔sentinel bridge added: src/bridge.rs + `ghost hook`/`ghost install` subcommands. ghost is now a PreToolUse middleware that wraps sentinel — runs offense, defers to sentinel's policy, narrates blocks in voice (varied kaomoji roasts per BlockCategory), grafts the roast into the deny reason the agent sees + logs it to ~/.ghost/blocks.log. never downgrades a deny, never auto-allows, fails closed. verified end-to-end against the real sentinel binary. 63 tests, clippy --all-targets/fmt clean. spec: docs/superpowers/specs/2026-06-14-ghost-sentinel-bridge-design.md)
 
 ## project overview
 
@@ -49,6 +51,7 @@ ghost/
 │   ├── event.rs         # Event enum + PersonalityHint (core data model)
 │   ├── interceptor.rs   # attachment backends (real v1: CommandWrapper using std::process for exec/capture of CommandOutput, ProxyStub). emits pure Events only. banners + dry_run safety. no gadgets/mutation here.
 │   ├── session.rs       # owns live run, ingests events (core bus), applies gadgets, tracks roasts/mutations/distrust/face. attach_with_interceptor(events) wires wrapper output. SessionMetrics for visibility.
+│   ├── watchlog.rs      # the bridge↔live-view pipe. CallRecord (serde JSONL) appended to ~/.ghost/events.jsonl on every bridged call; read_all/read_from (byte-offset tail) + format_watch_line. pure (de)serialize/format, fs binding thin. feeds `ghost watch` + `ghost blocks`.
 │   ├── personality.rs   # roast engine. single source of @ThatbV voice. kaomoji, blunt, "zero chill"
 │   ├── gadgets/
 │   │   └── mod.rs       # Gadget trait + stubs (PokeGadget, RoastGadget) + registry. apply returns hint
@@ -73,6 +76,7 @@ annotated:
 - **command wrapper (v1 primary)**: std::process::Command exec + capture stdout/stderr to CommandOutput events. always prints + emits "👻 ghost attached (observe only)" banner in voice. dry_run only for banner/observe wording + gadget count (exec of target always happens per attach intent). loud errors on fail ("well that was a silent no-op XX").
 - **basic event bus**: in Session (ingest + attach_with_interceptor). updates distrust_score + ghost_face_state on roasts. no channels yet (vec collect for v1 sync attach).
 - **safety first**: dry-run everywhere in v1. explicit banners on attach. no auto-mutate. resource limits planned.
+- **the live watch (bridge → loud TUI)**: `ghost hook` runs headless once per tool call, so the reacting ghost face had nothing to react to. watchlog.rs closes that: every bridged call appends a `CallRecord` (JSONL: ts_ms, tool, command, decision deny|pass, category, roast) to `~/.ghost/events.jsonl`. `ghost watch` tails it (read_all to seed recent history, then read_from byte-offset poll inside the crossterm loop) and drives the face live — side-eye on a pass, full 💀 ZeroChill on a block, the roast dropped into the activity stream. headless watch is `tail -f` in voice. the feed is also what `ghost blocks` summarizes. BridgeOutcome gained tool/command/category so the feed can be built without re-parsing.
 - **the bridge (offense+defense loop)**: `ghost hook` is a PreToolUse middleware. flow: stdin tool-call -> ghost offense (observe mode = no payload mutation) -> `sentinel evaluate` subprocess -> on deny, classify (BlockCategory) + produce_block_roast (varied, kaomoji) + graft into the deny reason (agent-facing) + emit block event to ~/.ghost/blocks.log (you-facing) -> re-emit the decision on stdout. wire contract preserved exactly: nested `hookSpecificOutput.deny` to block, empty `{}` to defer. INVARIANTS (in bridge.rs, tested): never downgrade a deny, never fabricate an `allow`, fail CLOSED if sentinel is unreachable, observe never mutates the payload. the bridge core is a pure fn over a mockable `SentinelOracle` so the whole loop is unit-tested without spawning sentinel.
 - **state management**: Session owns the truth for a run (events vec, counters, active gadgets, dry_run flag). no global.
 - **renderer (TUI)**: ratatui widgets custom (face kaomoji from GhostFaceState + intensity, glitch activity on high/party face via spans/invert, bar uses gadget descs+hotkeys in voice, status/livelog from metrics+LogLines), crossterm raw loop + Layout splits per spec (top face 7, main 62/38 activity/gadgets, bottom status+log), overlays (centered popups help/confirm with X voice), keys (q quit, 1-9 gadget, h help, space pause, r roast), resize, App owns Session for consume+activate. headless if !tty || GHOST_HEADLESS (prints events + roasts + face emoji in voice). TDD via Buffer::empty + render asserts on kaomoji/glitch/voice/layout.
@@ -147,7 +151,12 @@ cargo run -- replay attach-17184...
 cargo run -- install --sentinel /path/to/sentinel   # wire ghost hook into ~/.claude/settings.json (idempotent, wraps sentinel)
 cargo run -- install --uninstall                    # remove the bridge hook
 echo '{"tool_name":"Bash","tool_input":{"command":"ls"}}' | cargo run -- hook --sentinel /path/to/sentinel  # per-call bridge (claude code invokes this)
-# block -> nested deny w/ voice on stdout + roast on stderr + ~/.ghost/blocks.log ; allow -> {}
+# block -> nested deny w/ voice on stdout + roast on stderr + ~/.ghost/blocks.log + structured ~/.ghost/events.jsonl ; allow -> {}
+
+# the live watch (face reacts to your real session via the bridge feed)
+cargo run -- watch                       # tui: tail ~/.ghost/events.jsonl, face reacts live (q quits)
+cargo run -- --headless watch            # tail -f in voice (every tool call, live)
+cargo run -- watch --path /tmp/feed.jsonl  # explicit feed path
 
 # test (tdd style, run often)
 cargo test

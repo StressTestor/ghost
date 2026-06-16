@@ -71,6 +71,17 @@ ghost is offense bolted onto defense, never a way around it:
 
 the roasts vary per block category (cred-access, pipe-to-shell, destructive, persistence, exfil) and are loud as hell. uninstall with `ghost install --uninstall`. full design in `docs/superpowers/specs/2026-06-14-ghost-sentinel-bridge-design.md`.
 
+### watch it live
+
+the bridge runs headless, but it also writes a structured feed: every tool call (block or pass) lands in `~/.ghost/events.jsonl`. `ghost watch` tails that feed and reacts in real time.
+
+```bash
+ghost watch              # spooky tui. face side-eyes passes, goes full 💀 on blocks
+ghost --headless watch   # tail -f for the feed, every call in voice
+```
+
+so it's not "read the logs later". the ghost face reacts to your actual session as it happens. blocks drop their roast straight into the activity stream.
+
 ## example `ghost --help`
 
 ```
@@ -126,6 +137,7 @@ ghost attach <command...> [--gadgets poke,roast] [--dry-run]
 ghost proxy <addr>
 ghost run --config my-chaos.toml
 ghost replay <session-id>
+ghost watch [--path <feed.jsonl>]    # tail the bridge feed live, face reacts in real time
 ghost gadgets
 ghost install --sentinel <path>      # wire the bridge into claude code (wraps sentinel)
 ghost hook --sentinel <path>         # the per-call bridge (claude code invokes this)

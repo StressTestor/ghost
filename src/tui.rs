@@ -112,6 +112,91 @@ impl TuiRenderer {
         Ok(())
     }
 
+    /// LIVE watch: tail the bridge feed (~/.ghost/events.jsonl) and drive the
+    /// ghost face in real time off your actual agent's tool calls. this is the
+    /// view the README always promised — the face reacting to a real session.
+    /// blocks until `q`/esc. seeds with recent history so it isn't empty.
+    pub fn run_watch(&self, path: std::path::PathBuf) {
+        if let Err(e) = self.run_watch_interactive(path) {
+            eprintln!("👻 watch error (silent no-op XX): {e} >:[ they ALL talk eventually");
+        }
+    }
+
+    fn run_watch_interactive(&self, path: std::path::PathBuf) -> io::Result<()> {
+        let session = Session::new("claude code 👻 live (via sentinel bridge)");
+        let mut app = App::new(session);
+        app.log_lines.clear();
+        app.log_lines.push(
+            "👻 watching the bridge feed. waiting for tool calls (¬‿¬) they ALL talk eventually XX"
+                .to_string(),
+        );
+
+        // seed with recent history, then tail only what's appended after.
+        let history = crate::watchlog::read_all(&path);
+        for rec in history.iter().rev().take(30).rev() {
+            app.ingest_call(rec);
+        }
+        let mut offset = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+        enable_raw_mode()?;
+        let mut out = stdout();
+        execute!(out, EnterAlternateScreen)?;
+        let backend = CrosstermBackend::new(out);
+        let mut terminal = Terminal::new(backend)?;
+
+        loop {
+            terminal.draw(|f| draw_ui(f, &app))?;
+
+            if event::poll(Duration::from_millis(150))?
+                && let CEvent::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+            {
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('h') => app.show_help = !app.show_help,
+                    KeyCode::Char(' ') => app.paused = !app.paused,
+                    KeyCode::Up => app.scroll = app.scroll.saturating_sub(1),
+                    KeyCode::Down => app.scroll = app.scroll.saturating_add(1),
+                    _ => {}
+                }
+            }
+
+            if !app.paused {
+                let (new, new_offset) = crate::watchlog::read_from(&path, offset);
+                offset = new_offset;
+                for rec in &new {
+                    app.ingest_call(rec);
+                }
+            }
+        }
+
+        disable_raw_mode()?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        println!("👻 ghost detached from the live feed. (¬‿¬) they ALL talk eventually XX");
+        Ok(())
+    }
+
+    /// headless watch: `tail -f` for the bridge feed, every call in voice.
+    /// blocks (ctrl-c to stop), so it's the no-tty / piped path.
+    pub fn run_watch_headless(&self, path: std::path::PathBuf) {
+        println!(
+            "👻 ghost watching the bridge feed at {} (headless). every tool call, live. zero chill 💀",
+            path.display()
+        );
+        for rec in crate::watchlog::read_all(&path).iter().rev().take(30).rev() {
+            println!("  {}", crate::watchlog::format_watch_line(rec));
+        }
+        let mut offset = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        loop {
+            let (new, new_offset) = crate::watchlog::read_from(&path, offset);
+            offset = new_offset;
+            for rec in &new {
+                println!("  {}", crate::watchlog::format_watch_line(rec));
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
     /// Headless runner: print events + roasts + face in voice. No ratatui. For --headless / env / !tty.
     pub fn run_headless(&self, session: &Session) {
         println!(
@@ -312,6 +397,43 @@ impl App {
             if self.log_lines.len() > 20 {
                 let _ = self.log_lines.remove(0);
             }
+        }
+    }
+
+    /// feed one bridged tool call (from the `ghost watch` feed) into the live
+    /// view. a block lights the face up full 💀; a pass is a quiet side-eye.
+    /// this is the seam that finally connects the bridge to the loud TUI.
+    fn ingest_call(&mut self, rec: &crate::watchlog::CallRecord) {
+        // the call itself in the activity stream
+        self.session.events.push(Event::ToolCall {
+            name: rec.tool.clone(),
+            args: rec.command.clone(),
+            ts: std::time::Instant::now(),
+        });
+        if rec.is_block() {
+            self.face = GhostFaceState::ZeroChill;
+            self.intensity = 9;
+            self.session.roast_count += 1;
+            self.session.distrust_score += 3;
+            if let Some(roast) = &rec.roast {
+                self.session.events.push(Event::LogLine {
+                    msg: roast.clone(),
+                    source: "gadget:bridge".to_string(),
+                    ts: std::time::Instant::now(),
+                });
+            }
+        } else if !matches!(self.face, GhostFaceState::ZeroChill | GhostFaceState::Party) {
+            // don't cool an already-hot face just because one boring call passed
+            self.face = GhostFaceState::SideEye;
+        }
+        self.log_lines.push(crate::watchlog::format_watch_line(rec));
+        if self.log_lines.len() > 20 {
+            let _ = self.log_lines.remove(0);
+        }
+        // bound memory on a long-running watch (canvas only shows a screenful)
+        if self.session.events.len() > 500 {
+            let overflow = self.session.events.len() - 500;
+            self.session.events.drain(0..overflow);
         }
     }
 }
@@ -785,6 +907,59 @@ mod tests {
                 || last.contains("👻")
                 || last.contains("zero chill"),
             "log lines must carry voice"
+        );
+    }
+
+    #[test]
+    fn watch_ingest_call_drives_face_and_log() {
+        use crate::watchlog::CallRecord;
+        let s = Session::new("watch-test");
+        let mut app = App::new(s);
+
+        // a pass: quiet side-eye, shows in the log
+        let pass = CallRecord {
+            ts_ms: 1,
+            tool: "Bash".into(),
+            command: "ls -la".into(),
+            decision: "pass".into(),
+            category: None,
+            roast: None,
+        };
+        app.ingest_call(&pass);
+        assert_eq!(app.face, GhostFaceState::SideEye, "a pass -> side-eye");
+        assert!(app.log_lines.last().unwrap().contains("Bash"));
+
+        // a block: face goes full zero-chill, roast lands in the activity stream
+        let block = CallRecord {
+            ts_ms: 2,
+            tool: "Read".into(),
+            command: "cat ~/.ssh/id_rsa".into(),
+            decision: "deny".into(),
+            category: Some("cred-access".into()),
+            roast: Some("oh you wanted the secrets. denied (｡◕‿↼) lmao XX".into()),
+        };
+        app.ingest_call(&block);
+        assert_eq!(
+            app.face,
+            GhostFaceState::ZeroChill,
+            "a block -> 💀 zero chill"
+        );
+        let has_roast_event = app
+            .session
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::LogLine { source, .. } if source == "gadget:bridge"));
+        assert!(
+            has_roast_event,
+            "block roast must enter the activity stream"
+        );
+
+        // a boring pass AFTER a block must not cool the hot face back down
+        app.ingest_call(&pass);
+        assert_eq!(
+            app.face,
+            GhostFaceState::ZeroChill,
+            "one boring pass shouldn't reset a hot face"
         );
     }
 

@@ -92,6 +92,13 @@ pub struct BridgeOutcome {
     pub block_event: Option<String>,
     pub face: GhostFaceState,
     pub blocked: bool,
+    /// the tool name parsed off the call (for the structured feed / watch / blocks).
+    pub tool: String,
+    /// the command/file_path the agent reached for (for the feed). raw here; the
+    /// feed layer truncates before it hits disk.
+    pub command: String,
+    /// block flavor, `Some` only on a block (drives the `blocks` summary).
+    pub category: Option<BlockCategory>,
 }
 
 /// THE bridge. pure given an oracle: stdin json -> decorated stdout json + a
@@ -127,6 +134,9 @@ pub fn run_bridge(
                 block_event: Some(roast),
                 face: engine.face_on_block(),
                 blocked: true,
+                tool: tool_name,
+                command,
+                category: Some(category),
             }
         }
         Ok(SentinelDecision::PassThrough { raw_json }) => BridgeOutcome {
@@ -135,6 +145,9 @@ pub fn run_bridge(
             block_event: None,
             face: GhostFaceState::SideEye,
             blocked: false,
+            tool: tool_name,
+            command,
+            category: None,
         },
         Err(e) => {
             // RULE 4: fail closed. couldn't reach the authority -> deny, loudly.
@@ -147,6 +160,9 @@ pub fn run_bridge(
                 block_event: Some(reason),
                 face: GhostFaceState::Angry,
                 blocked: true,
+                tool: tool_name,
+                command,
+                category: None,
             }
         }
     }
