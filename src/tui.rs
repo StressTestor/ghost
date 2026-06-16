@@ -204,30 +204,7 @@ impl TuiRenderer {
         );
         println!("target: {} (they ALL talk eventually XX)", session.target);
         for ev in &session.events {
-            match ev {
-                Event::LogLine { msg, source, .. } => {
-                    if source.starts_with("gadget:")
-                        || msg.contains("👻")
-                        || msg.contains("zero chill")
-                        || msg.contains("they ALL")
-                        || msg.contains(">:[")
-                        || msg.contains("(¬")
-                    {
-                        println!("  {}", msg);
-                    } else {
-                        println!("  [log:{}] {}", source, msg);
-                    }
-                }
-                Event::CommandOutput { line, stream, .. } => {
-                    println!("  [{}] {}", stream, line);
-                }
-                Event::ToolCall { name, args, .. } => {
-                    println!("  [toolcall] {} args={}", name, args);
-                }
-                Event::Response { body, status, .. } => {
-                    println!("  [response] {} status={:?}", body, status);
-                }
-            }
+            println!("  {}", render_event_line(ev));
         }
         let m = session.get_metrics();
         println!("{}", session.summary());
@@ -306,6 +283,30 @@ impl TuiRenderer {
                 msg
             }
         }
+    }
+}
+
+/// one event as a voice-flavored line for the headless / live stream. shared by
+/// `run_headless` and the live `attach` headless path so batch and streaming
+/// output read identically. pure -> unit-tested.
+pub fn render_event_line(ev: &Event) -> String {
+    match ev {
+        Event::LogLine { msg, source, .. } => {
+            if source.starts_with("gadget:")
+                || msg.contains("👻")
+                || msg.contains("zero chill")
+                || msg.contains("they ALL")
+                || msg.contains(">:[")
+                || msg.contains("(¬")
+            {
+                msg.clone()
+            } else {
+                format!("[log:{source}] {msg}")
+            }
+        }
+        Event::CommandOutput { line, stream, .. } => format!("[{stream}] {line}"),
+        Event::ToolCall { name, args, .. } => format!("[toolcall] {name} args={args}"),
+        Event::Response { body, status, .. } => format!("[response] {body} status={status:?}"),
     }
 }
 
@@ -908,6 +909,42 @@ mod tests {
                 || last.contains("zero chill"),
             "log lines must carry voice"
         );
+    }
+
+    #[test]
+    fn render_event_line_formats_each_variant_in_voice() {
+        let cmd = Event::CommandOutput {
+            line: "hello".into(),
+            stream: "stdout".into(),
+            ts: Instant::now(),
+        };
+        assert_eq!(render_event_line(&cmd), "[stdout] hello");
+
+        // a voicey gadget log shows raw (the roast speaks for itself)
+        let roast = Event::LogLine {
+            msg: "zero chill detected 💀".into(),
+            source: "gadget:roast".into(),
+            ts: Instant::now(),
+        };
+        assert_eq!(render_event_line(&roast), "zero chill detected 💀");
+
+        // a plain log gets the [log:source] prefix
+        let plain = Event::LogLine {
+            msg: "boring".into(),
+            source: "interceptor:command".into(),
+            ts: Instant::now(),
+        };
+        assert_eq!(
+            render_event_line(&plain),
+            "[log:interceptor:command] boring"
+        );
+
+        let tool = Event::ToolCall {
+            name: "Bash".into(),
+            args: "ls".into(),
+            ts: Instant::now(),
+        };
+        assert_eq!(render_event_line(&tool), "[toolcall] Bash args=ls");
     }
 
     #[test]

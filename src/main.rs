@@ -69,8 +69,20 @@ fn main() {
             // dry_run passed down fully. banners always "👻 ghost attached ..."
             println!("wrapping with command interceptor (👻 attached banner + capture)...");
             let wrapper = CommandWrapper::new(command);
-            let events = wrapper.run(dry_run);
-            session.attach_with_interceptor(events);
+
+            if is_headless {
+                // LIVE: stream every line to the terminal the instant it lands,
+                // ingesting into the bus as it goes (no batch-then-dump).
+                println!("--- live event stream 👻 (streaming, they ALL talk eventually XX) ---");
+                wrapper.run_streaming(dry_run, &mut |ev| {
+                    println!("  {}", ghost::tui::render_event_line(&ev));
+                    session.ingest(ev);
+                });
+            } else {
+                // tui reviews the trace post-hoc, so collect it.
+                let events = wrapper.run(dry_run);
+                session.attach_with_interceptor(events);
+            }
 
             // basic recording save (for replay cmd). uses personality_lines + voice banners collected in session.
             let ts = std::time::SystemTime::now()
@@ -85,8 +97,16 @@ fn main() {
             }
 
             if is_headless {
-                let renderer = TuiRenderer::new();
-                renderer.run_headless(&session);
+                // events already streamed live above; just the summary + face.
+                let m = session.get_metrics();
+                println!("{}", session.summary());
+                println!(
+                    "ghost face: {} | distrust: {} | roasts: {} (｡◕‿↼) CHAOS FOR SCIENCE",
+                    m.face.emoji(),
+                    m.distrust_score,
+                    m.roast_count
+                );
+                println!("-- end trace -- they ALL talk eventually XX lmao");
             } else {
                 // show captured for tui case (voice roasts from personality via bus)
                 println!(
@@ -94,22 +114,7 @@ fn main() {
                     session.events.len()
                 );
                 for ev in &session.events {
-                    match ev {
-                        ghost::Event::CommandOutput { line, stream, .. } => {
-                            println!("  [{}] {}", stream, line);
-                        }
-                        ghost::Event::LogLine { msg, source, .. } => {
-                            if source.starts_with("gadget:")
-                                || msg.contains("👻")
-                                || msg.contains("ghost attached")
-                            {
-                                println!("  {}", msg);
-                            } else {
-                                println!("  [log:{}] {}", source, msg);
-                            }
-                        }
-                        _ => println!("  {:?}", ev),
-                    }
+                    println!("  {}", ghost::tui::render_event_line(ev));
                 }
                 println!("{}", session.summary());
                 println!("(they ALL talk eventually XX)");

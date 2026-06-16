@@ -1,5 +1,7 @@
 use crate::event::Event;
-use std::process::Command;
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::Instant;
 
 /// Interceptor / Attachment layer.
@@ -73,7 +75,27 @@ impl CommandWrapper {
     /// Run the wrapper: exec + full capture -> Vec<Event> for the bus.
     /// dry_run: true -> "observe only" banner (safety default). Command still runs (attach = watch your thing).
     /// Returns events including banner LogLine + per-line CommandOutput + final exit log.
+    ///
+    /// thin collector over `run_streaming`: same events, same order, just buffered
+    /// into a Vec for callers (and the TUI) that review post-hoc. live consumers
+    /// (headless attach) call `run_streaming` directly so output scrolls as it lands.
     pub fn run(&self, dry_run: bool) -> Vec<Event> {
+        let mut events: Vec<Event> = Vec::new();
+        self.run_streaming(dry_run, &mut |e| events.push(e));
+        events
+    }
+
+    /// Stream the wrapped command's output LIVE: each captured line is handed to
+    /// `sink` the instant it arrives, not after the process exits. this is what
+    /// makes "live activity scrolls real events" actually true.
+    ///
+    /// stdout + stderr are drained on separate threads into one channel, so a
+    /// chatty stream on one pipe can't deadlock by filling its buffer while we
+    /// block on the other. order within a stream is preserved; cross-stream order
+    /// is arrival order. returns the child's exit code (-1 if it never launched).
+    /// dry_run only flavors the banner — attach always execs the target (you asked
+    /// to watch your thing); ghost itself never mutates the command.
+    pub fn run_streaming(&self, dry_run: bool, sink: &mut dyn FnMut(Event)) -> i32 {
         let target = if self.command.is_empty() {
             "(empty)".to_string()
         } else {
@@ -94,52 +116,31 @@ impl CommandWrapper {
 
         // explicit attached banner, per spec safety. stderr so it shows even if stdout captured.
         eprintln!("{}", banner);
-
-        let mut events: Vec<Event> = vec![Event::LogLine {
-            msg: banner.clone(),
+        sink(Event::LogLine {
+            msg: banner,
             source: "interceptor:command".to_string(),
             ts: Instant::now(),
-        }];
+        });
 
         if self.command.is_empty() {
-            events.push(Event::LogLine {
+            sink(Event::LogLine {
                 msg: "no command provided. fuck off pete energy".to_string(),
                 source: "error".to_string(),
                 ts: Instant::now(),
             });
-            return events;
+            return -1;
         }
 
         let cmd_name = &self.command[0];
         let args: Vec<&str> = self.command[1..].iter().map(|s| s.as_str()).collect();
 
-        match Command::new(cmd_name).args(&args).output() {
-            Ok(output) => {
-                for line in String::from_utf8_lossy(&output.stdout).lines() {
-                    if !line.trim().is_empty() {
-                        events.push(Event::CommandOutput {
-                            line: line.to_string(),
-                            stream: "stdout".to_string(),
-                            ts: Instant::now(),
-                        });
-                    }
-                }
-                for line in String::from_utf8_lossy(&output.stderr).lines() {
-                    if !line.trim().is_empty() {
-                        events.push(Event::CommandOutput {
-                            line: line.to_string(),
-                            stream: "stderr".to_string(),
-                            ts: Instant::now(),
-                        });
-                    }
-                }
-                let code = output.status.code();
-                events.push(Event::LogLine {
-                    msg: format!("command exited with code: {:?} 👻", code),
-                    source: "interceptor:command".to_string(),
-                    ts: Instant::now(),
-                });
-            }
+        let mut child = match Command::new(cmd_name)
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
             Err(e) => {
                 // fail loudly, never swallow. voice per @ThatbV style.
                 let err_msg = format!(
@@ -147,15 +148,64 @@ impl CommandWrapper {
                     target, e
                 );
                 eprintln!(">[: {}", err_msg);
-                events.push(Event::LogLine {
+                sink(Event::LogLine {
                     msg: err_msg,
                     source: "error".to_string(),
                     ts: Instant::now(),
                 });
+                return -1;
             }
-        }
+        };
 
-        events
+        let (tx, rx) = mpsc::channel::<Event>();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        let tx_out = tx.clone();
+        let h_out = std::thread::spawn(move || {
+            if let Some(o) = stdout {
+                for line in BufReader::new(o).lines().map_while(Result::ok) {
+                    if !line.trim().is_empty() {
+                        let _ = tx_out.send(Event::CommandOutput {
+                            line,
+                            stream: "stdout".to_string(),
+                            ts: Instant::now(),
+                        });
+                    }
+                }
+            }
+        });
+        let tx_err = tx.clone();
+        let h_err = std::thread::spawn(move || {
+            if let Some(e) = stderr {
+                for line in BufReader::new(e).lines().map_while(Result::ok) {
+                    if !line.trim().is_empty() {
+                        let _ = tx_err.send(Event::CommandOutput {
+                            line,
+                            stream: "stderr".to_string(),
+                            ts: Instant::now(),
+                        });
+                    }
+                }
+            }
+        });
+        // drop our own sender so the channel closes once both readers finish.
+        drop(tx);
+
+        // LIVE: each line hits the sink as it arrives off the pipes.
+        for ev in rx {
+            sink(ev);
+        }
+        let _ = h_out.join();
+        let _ = h_err.join();
+
+        let code = child.wait().ok().and_then(|s| s.code());
+        sink(Event::LogLine {
+            msg: format!("command exited with code: {:?} 👻", code),
+            source: "interceptor:command".to_string(),
+            ts: Instant::now(),
+        });
+        code.unwrap_or(-1)
     }
 }
 

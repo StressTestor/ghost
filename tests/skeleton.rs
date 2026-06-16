@@ -200,6 +200,64 @@ fn config_gadgets_and_voice_prefs_for_cli_wiring() {
 }
 
 #[test]
+fn command_wrapper_streams_events_live_via_sink() {
+    // run_streaming must hand each line to the sink as it arrives (live), capture
+    // BOTH stdout and stderr without deadlocking, and report the real exit code.
+    let wrapper = ghost::interceptor::CommandWrapper::new(vec![
+        "sh".into(),
+        "-c".into(),
+        "echo out1; echo err1 1>&2; echo out2".into(),
+    ]);
+    let mut seen: Vec<Event> = Vec::new();
+    let code = wrapper.run_streaming(true, &mut |e| seen.push(e));
+
+    assert_eq!(code, 0, "exit code surfaced");
+    // banner is first (attached before anything runs)
+    assert!(
+        matches!(&seen[0], Event::LogLine { msg, .. } if msg.contains("👻 ghost attached")),
+        "banner emitted first"
+    );
+    let outs: Vec<(String, String)> = seen
+        .iter()
+        .filter_map(|e| match e {
+            Event::CommandOutput { line, stream, .. } => Some((line.clone(), stream.clone())),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        outs.iter()
+            .any(|(l, s)| l.contains("out1") && s == "stdout"),
+        "captured stdout live"
+    );
+    assert!(
+        outs.iter()
+            .any(|(l, s)| l.contains("err1") && s == "stderr"),
+        "captured stderr live (no deadlock)"
+    );
+    assert!(outs.iter().any(|(l, _)| l.contains("out2")));
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, Event::LogLine { msg, .. } if msg.contains("exited with code"))),
+        "exit logline closes the stream"
+    );
+}
+
+#[test]
+fn command_wrapper_bad_cmd_streams_loud_error_and_nonzero() {
+    let wrapper =
+        ghost::interceptor::CommandWrapper::new(vec!["definitely-not-a-real-cmd-xyz-789".into()]);
+    let mut seen: Vec<Event> = Vec::new();
+    let code = wrapper.run_streaming(true, &mut |e| seen.push(e));
+    assert_eq!(code, -1, "failed launch reports -1");
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, Event::LogLine { msg, source, .. }
+            if source == "error" && msg.contains("exec failed"))),
+        "loud error event, never swallowed"
+    );
+}
+
+#[test]
 fn attach_dry_run_via_wrapper_and_session_emits_voice_banners_no_side_effects() {
     // integration: use real CommandWrapper (as attach does) + session bus + dry
     // asserts exact banners + personality roasts in voice, dry passed, no "real mode" text
