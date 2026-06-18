@@ -99,6 +99,9 @@ pub struct BridgeOutcome {
     pub command: String,
     /// block flavor, `Some` only on a block (drives the `blocks` summary).
     pub category: Option<BlockCategory>,
+    /// id of the roast template that fired (`"{category}:{idx}"`), `Some` only on
+    /// a block. stamped into the feed so the recency window steers the next pick.
+    pub roast_id: Option<String>,
 }
 
 /// THE bridge. pure given an oracle: stdin json -> decorated stdout json + a
@@ -108,6 +111,7 @@ pub fn run_bridge(
     engine: &PersonalityEngine,
     oracle: &dyn SentinelOracle,
     cfg: &BridgeConfig,
+    recent_ids: &[String],
 ) -> BridgeOutcome {
     let (tool_name, command) = parse_tool_call(input_json);
 
@@ -122,21 +126,22 @@ pub fn run_bridge(
     match oracle.evaluate(&payload_for_sentinel) {
         Ok(SentinelDecision::Deny { reason }) => {
             let category = BlockCategory::classify(&tool_name, &reason, &command);
-            let roast = engine.produce_block_roast(&tool_name, &command, category);
+            let roast = engine.produce_block_roast(&tool_name, &command, category, recent_ids);
             // RULE 1/2: it's a deny in, it's a deny out. we only decorate the reason.
             let final_reason = if cfg.narrate_to_agent {
-                format!("{reason}. 👻 {roast}")
+                format!("{reason}. 👻 {}", roast.text)
             } else {
                 reason
             };
             BridgeOutcome {
                 hook_stdout: deny_json(&final_reason),
-                block_event: Some(roast),
+                block_event: Some(roast.text),
                 face: engine.face_on_block(),
                 blocked: true,
                 tool: tool_name,
                 command,
                 category: Some(category),
+                roast_id: Some(roast.id),
             }
         }
         Ok(SentinelDecision::PassThrough { raw_json }) => BridgeOutcome {
@@ -148,6 +153,7 @@ pub fn run_bridge(
             tool: tool_name,
             command,
             category: None,
+            roast_id: None,
         },
         Err(e) => {
             // RULE 4: fail closed. couldn't reach the authority -> deny, loudly.
@@ -155,6 +161,7 @@ pub fn run_bridge(
             let reason = format!(
                 "ghost-sentinel bridge failed closed ({e}). blocking by default, fix your defense >:[ 💀 they ALL talk eventually XX"
             );
+            // the fail-closed line isn't from a pool, so no roast_id.
             BridgeOutcome {
                 hook_stdout: deny_json(&reason),
                 block_event: Some(reason),
@@ -163,6 +170,7 @@ pub fn run_bridge(
                 tool: tool_name,
                 command,
                 category: None,
+                roast_id: None,
             }
         }
     }
@@ -394,7 +402,7 @@ mod tests {
         let oracle = MockSentinel(Ok(SentinelDecision::Deny {
             reason: "pipe to shell execution".into(),
         }));
-        let out = run_bridge(CURL_PIPE, &engine(), &oracle, &BridgeConfig::default());
+        let out = run_bridge(CURL_PIPE, &engine(), &oracle, &BridgeConfig::default(), &[]);
         let v: Value = serde_json::from_str(&out.hook_stdout).unwrap();
         assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse");
         assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
@@ -411,11 +419,44 @@ mod tests {
     }
 
     #[test]
+    fn recency_window_steers_the_block_roast_pick() {
+        // window = every pipe-to-shell line EXCEPT the last index. run_bridge must
+        // classify pipe-to-shell and pick the one eligible line, stamping its id.
+        let pool_len =
+            crate::personality::PersonalityEngine::block_roast_pool(BlockCategory::PipeToShell)
+                .len();
+        let window: Vec<String> = (0..pool_len - 1)
+            .map(|i| format!("pipe-to-shell:{i}"))
+            .collect();
+        let oracle = MockSentinel(Ok(SentinelDecision::Deny {
+            reason: "pipe to shell".into(),
+        }));
+        let out = run_bridge(
+            CURL_PIPE,
+            &engine(),
+            &oracle,
+            &BridgeConfig::default(),
+            &window,
+        );
+        assert_eq!(
+            out.roast_id.as_deref(),
+            Some(format!("pipe-to-shell:{}", pool_len - 1).as_str()),
+            "with the rest of the pool recent, ghost reaches for the one fresh line"
+        );
+        // and a pass carries no roast_id
+        let pass_oracle = MockSentinel(Ok(SentinelDecision::PassThrough {
+            raw_json: "{}".into(),
+        }));
+        let pass = run_bridge(LS, &engine(), &pass_oracle, &BridgeConfig::default(), &[]);
+        assert!(pass.roast_id.is_none(), "passes don't get a roast_id");
+    }
+
+    #[test]
     fn defer_passes_through_as_empty_object_never_allow() {
         let oracle = MockSentinel(Ok(SentinelDecision::PassThrough {
             raw_json: "{}".into(),
         }));
-        let out = run_bridge(LS, &engine(), &oracle, &BridgeConfig::default());
+        let out = run_bridge(LS, &engine(), &oracle, &BridgeConfig::default(), &[]);
         assert_eq!(out.hook_stdout.trim(), "{}");
         assert!(!out.blocked && out.block_event.is_none());
         assert!(
@@ -431,7 +472,7 @@ mod tests {
             let oracle = MockSentinel(Ok(SentinelDecision::Deny {
                 reason: reason.into(),
             }));
-            let out = run_bridge(CURL_PIPE, &engine(), &oracle, &BridgeConfig::default());
+            let out = run_bridge(CURL_PIPE, &engine(), &oracle, &BridgeConfig::default(), &[]);
             let v: Value = serde_json::from_str(&out.hook_stdout).unwrap();
             assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
             assert!(!out.hook_stdout.contains("\"allow\""));
@@ -441,7 +482,7 @@ mod tests {
     #[test]
     fn sentinel_error_fails_closed_to_a_deny() {
         let oracle = MockSentinel(Err(BridgeError::Unreachable("down".into())));
-        let out = run_bridge(CURL_PIPE, &engine(), &oracle, &BridgeConfig::default());
+        let out = run_bridge(CURL_PIPE, &engine(), &oracle, &BridgeConfig::default(), &[]);
         let v: Value = serde_json::from_str(&out.hook_stdout).unwrap();
         assert_eq!(
             v["hookSpecificOutput"]["permissionDecision"], "deny",
@@ -460,7 +501,7 @@ mod tests {
         let oracle = MockSentinel(Ok(SentinelDecision::Deny {
             reason: "pipe to shell".into(),
         }));
-        let out = run_bridge(CURL_PIPE, &engine(), &oracle, &cfg);
+        let out = run_bridge(CURL_PIPE, &engine(), &oracle, &cfg, &[]);
         let v: Value = serde_json::from_str(&out.hook_stdout).unwrap();
         let reason = v["hookSpecificOutput"]["permissionDecisionReason"]
             .as_str()
@@ -507,7 +548,7 @@ mod tests {
         let spy = Spy {
             seen: std::cell::RefCell::new(String::new()),
         };
-        run_bridge(CURL_PIPE, &engine(), &spy, &BridgeConfig::default());
+        run_bridge(CURL_PIPE, &engine(), &spy, &BridgeConfig::default(), &[]);
         assert_eq!(
             *spy.seen.borrow(),
             CURL_PIPE,

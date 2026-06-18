@@ -31,6 +31,11 @@ pub struct CallRecord {
     pub category: Option<String>,
     /// the voice line ghost fired, only present on a deny.
     pub roast: Option<String>,
+    /// id of the roast template that fired (`"{category}:{idx}"`), only on a deny.
+    /// drives the recency window. `serde(default)` so feed lines written before
+    /// this field existed still parse (-> None).
+    #[serde(default)]
+    pub roast_id: Option<String>,
 }
 
 impl CallRecord {
@@ -44,6 +49,7 @@ impl CallRecord {
             decision: if outcome.blocked { "deny" } else { "pass" }.to_string(),
             category: outcome.category.map(category_label),
             roast: outcome.block_event.clone(),
+            roast_id: outcome.roast_id.clone(),
         }
     }
 
@@ -87,16 +93,9 @@ fn truncate_cmd(cmd: &str) -> String {
 }
 
 /// stable lowercase label for a block category (what lands in the feed + stats).
+/// single source of truth lives on `BlockCategory::label`.
 pub fn category_label(cat: BlockCategory) -> String {
-    match cat {
-        BlockCategory::CredAccess => "cred-access",
-        BlockCategory::PipeToShell => "pipe-to-shell",
-        BlockCategory::Destructive => "destructive",
-        BlockCategory::Persistence => "persistence",
-        BlockCategory::NetworkExfil => "network-exfil",
-        BlockCategory::Unknown => "unknown",
-    }
-    .to_string()
+    cat.label().to_string()
 }
 
 /// ~/.ghost/events.jsonl — the structured feed `watch` tails and `blocks` reads.
@@ -174,6 +173,49 @@ pub fn read_from(path: &std::path::Path, offset: u64) -> (Vec<CallRecord>, u64) 
     let text = String::from_utf8_lossy(&bytes[..consumed]);
     let records = text.lines().filter_map(CallRecord::from_jsonl).collect();
     (records, start + consumed as u64)
+}
+
+/// how many recent blocks ghost "remembers" — the global recency window. don't
+/// reuse a roast line that fired within the last this-many blocks (unless the
+/// whole category pool is inside the window). 6 ≈ a pool's worth: kills the
+/// back-to-back staleness while keeping the chaos.
+pub const RECENCY_WINDOW: usize = 6;
+
+/// the recency window for roast selection: the `roast_id`s of the last `k`
+/// BLOCKS, most-recent-first. read off the tail of the feed (bounded — blocks
+/// are rare and we only read on a block, so this is cheap even on a huge feed).
+/// missing/empty feed -> empty window (everything's fair game).
+pub fn recent_block_roast_ids(path: &std::path::Path, k: usize) -> Vec<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    // a generous tail; holds far more than `k` blocks even with many passes between.
+    const CAP: u64 = 64 * 1024;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(CAP);
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
+    }
+    let mut bytes = Vec::new();
+    if f.read_to_end(&mut bytes).is_err() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines: Vec<&str> = text.lines().collect();
+    // if we seeked into the middle of the file, the first line is likely partial.
+    if start > 0 && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let mut ids: Vec<String> = lines
+        .iter()
+        .filter_map(|l| CallRecord::from_jsonl(l))
+        .filter(|r| r.is_block())
+        .filter_map(|r| r.roast_id)
+        .collect();
+    // keep the last k, return most-recent-first (what the selector expects).
+    let tail = ids.split_off(ids.len().saturating_sub(k));
+    tail.into_iter().rev().collect()
 }
 
 /// the one-line voice render of a call for the live watch stream / headless tail.
@@ -307,6 +349,7 @@ mod tests {
             tool: "Read".into(),
             command: "cat ~/.ssh/id_rsa".into(),
             category: Some(BlockCategory::CredAccess),
+            roast_id: Some("cred-access:2".into()),
         }
     }
 
@@ -319,6 +362,7 @@ mod tests {
             tool: "Bash".into(),
             command: "ls -la".into(),
             category: None,
+            roast_id: None,
         }
     }
 
@@ -499,6 +543,7 @@ mod tests {
             decision: "deny".into(),
             category: Some(cat.into()),
             roast: Some("blocked 💀".into()),
+            roast_id: Some(format!("{cat}:0")),
         }
     }
     fn pass(tool: &str, cmd: &str) -> CallRecord {
@@ -509,6 +554,7 @@ mod tests {
             decision: "pass".into(),
             category: None,
             roast: None,
+            roast_id: None,
         }
     }
 
@@ -563,6 +609,51 @@ mod tests {
         assert!(report.contains("Read: 2"));
         assert!(report.contains("AGAIN??"), "repeat command gets called out");
         assert!(report.contains("they ALL talk eventually XX"));
+    }
+
+    #[test]
+    fn recent_block_roast_ids_returns_last_k_blocks_most_recent_first() {
+        let path = std::env::temp_dir().join("ghost-watchlog-recency-7781400004.jsonl");
+        let _ = std::fs::remove_file(&path);
+
+        // interleave passes (no roast_id, must be ignored) with blocks carrying ids.
+        let mk_block = |id: &str| CallRecord {
+            ts_ms: 0,
+            tool: "Read".into(),
+            command: "x".into(),
+            decision: "deny".into(),
+            category: Some("cred-access".into()),
+            roast: Some("blocked".into()),
+            roast_id: Some(id.into()),
+        };
+        append_call_to(&path, &mk_block("cred-access:0"));
+        append_call_to(&path, &pass_call()); // a pass in the middle
+        append_call_to(&path, &mk_block("cred-access:3"));
+        append_call_to(&path, &mk_block("pipe-to-shell:1"));
+
+        // k=2 -> the two most recent block ids, newest first; passes excluded.
+        let window = recent_block_roast_ids(&path, 2);
+        assert_eq!(window, vec!["pipe-to-shell:1", "cred-access:3"]);
+
+        // k larger than available -> all blocks, still newest-first.
+        let all = recent_block_roast_ids(&path, 10);
+        assert_eq!(
+            all,
+            vec!["pipe-to-shell:1", "cred-access:3", "cred-access:0"]
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn pass_call() -> CallRecord {
+        CallRecord::from_outcome(&pass_outcome(), 0)
+    }
+
+    #[test]
+    fn recent_block_roast_ids_missing_feed_is_empty() {
+        let path = std::env::temp_dir().join("ghost-watchlog-recency-none-9992.jsonl");
+        let _ = std::fs::remove_file(&path);
+        assert!(recent_block_roast_ids(&path, 6).is_empty());
     }
 
     #[test]
