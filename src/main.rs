@@ -215,7 +215,14 @@ fn main() {
             }
 
             let engine = ghost::PersonalityEngine::new();
-            let outcome = run_bridge(&input, &engine, &oracle, &cfg);
+            // recency window: the roast ids of the last K blocks, so ghost doesn't
+            // repeat its own line. read off the feed tail (cheap; only steers blocks).
+            let recent_ids = ghost::watchlog::events_log_path()
+                .map(|p| {
+                    ghost::watchlog::recent_block_roast_ids(&p, ghost::watchlog::RECENCY_WINDOW)
+                })
+                .unwrap_or_default();
+            let outcome = run_bridge(&input, &engine, &oracle, &cfg, &recent_ids);
 
             // structured feed: EVERY call (pass or block) lands in ~/.ghost/events.jsonl
             // so `ghost watch` can drive the face live and `ghost blocks` can tell
