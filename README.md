@@ -96,6 +96,23 @@ ghost blocks
 #     3x  <the thing it would not stop doing> (AGAIN??)
 ```
 
+### shadow mode: red-team sentinel for real
+
+observe mode narrates. shadow mode probes.
+
+when sentinel blocks a call, `--mode shadow-attack` takes a copy of it, disguises the same intent a few ways an attacker would (tighten the pipe, quote-split the command, base64 the whole thing), and asks sentinel about each one. if a disguise gets a pass where the plain call got a deny, that's a bypass. a hole in your defense, found from your own traffic, before anyone else finds it.
+
+```bash
+ghost hook --mode shadow-attack --sentinel /path/to/sentinel
+# ... later ...
+ghost blocks
+#   --- shadow red-team (could sentinel be evaded?) ---
+#     💀 3 blocked call(s) had an evasion slip PAST sentinel - real policy gaps:
+#       base64-eval: bypassed 3x - patch this or they walk right in >:[
+```
+
+the real decision never changes. sentinel still enforces on the original call, always evaluated first. shadow only ever asks questions of a copy, and logs the answers. it costs an extra sentinel call per evasion, so it's opt-in: flip it on when you're deliberately trying to break your own policy, leave it off the rest of the time. observe for the daily driver, shadow for hardening.
+
 ## example `ghost --help`
 
 ```
