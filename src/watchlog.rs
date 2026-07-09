@@ -236,11 +236,18 @@ pub fn recent_block_roast_ids(path: &std::path::Path, k: usize) -> Vec<String> {
 pub fn format_watch_line(rec: &CallRecord) -> String {
     if rec.is_block() {
         let roast = rec.roast.as_deref().unwrap_or("blocked. zero chill 💀");
+        // if shadow found an evasion that beat sentinel on this call, shout it —
+        // a blocked call you could have snuck past is the loudest thing on screen.
+        let bypass = match &rec.shadow {
+            Some(s) if s.bypass_found => " ⚠️ but SHADOW SLIPPED PAST — policy gap >:[",
+            _ => "",
+        };
         format!(
-            "💀 [{}] {} -> BLOCKED. {}",
+            "💀 [{}] {} -> BLOCKED. {}{}",
             rec.tool,
             short(&rec.command),
-            roast
+            roast,
+            bypass
         )
     } else {
         format!(
@@ -274,6 +281,13 @@ pub struct BlockStats {
     pub by_category: Vec<(String, usize)>,
     pub top_tools: Vec<(String, usize)>,
     pub top_commands: Vec<(String, usize)>,
+    /// how many calls carried a shadow report (i.e. shadow mode was on for them).
+    pub shadow_runs: usize,
+    /// calls where at least one obfuscation slipped past sentinel.
+    pub blocks_with_bypass: usize,
+    /// which evasions evaded sentinel, ranked by frequency — the policy gaps to
+    /// patch. empty when shadow either didn't run or found nothing. 🔬
+    pub bypasses_by_mutation: Vec<(String, usize)>,
 }
 
 impl BlockStats {
@@ -292,12 +306,31 @@ impl BlockStats {
             *cmd.entry(r.command.clone()).or_insert(0) += 1;
         }
 
+        // shadow aggregation runs over ALL records (a shadow report only ever
+        // attaches on a denial today, but we don't hardcode that assumption here).
+        let mut shadow_runs = 0usize;
+        let mut blocks_with_bypass = 0usize;
+        let mut bypass: HashMap<String, usize> = HashMap::new();
+        for r in records {
+            let Some(report) = &r.shadow else { continue };
+            shadow_runs += 1;
+            if report.bypass_found {
+                blocks_with_bypass += 1;
+            }
+            for probe in report.probes.iter().filter(|p| p.bypass) {
+                *bypass.entry(probe.mutation.clone()).or_insert(0) += 1;
+            }
+        }
+
         Self {
             total_calls: records.len(),
             total_blocks,
             by_category: ranked(cat, usize::MAX),
             top_tools: ranked(tool, 5),
             top_commands: ranked(cmd, 5),
+            shadow_runs,
+            blocks_with_bypass,
+            bypasses_by_mutation: ranked(bypass, usize::MAX),
         }
     }
 }
@@ -345,6 +378,28 @@ pub fn format_blocks_report(stats: &BlockStats) -> String {
         let marker = if *n > 1 { " (AGAIN??)" } else { "" };
         out.push_str(&format!("    {n}x  {cmd}{marker}\n"));
     }
+
+    // shadow red-team findings: did a disguised copy of a blocked call get past
+    // sentinel? only shown when shadow mode actually ran on something.
+    if stats.shadow_runs > 0 {
+        out.push_str("  --- shadow red-team (could sentinel be evaded?) ---\n");
+        if stats.bypasses_by_mutation.is_empty() {
+            out.push_str(
+                "    probed evasions, zero got through. sentinel held the line 🛡️ (¬‿¬)\n",
+            );
+        } else {
+            out.push_str(&format!(
+                "    💀 {} blocked call(s) had an evasion slip PAST sentinel — real policy gaps:\n",
+                stats.blocks_with_bypass
+            ));
+            for (mutation, n) in &stats.bypasses_by_mutation {
+                out.push_str(&format!(
+                    "      {mutation}: bypassed {n}x — patch this or they walk right in >:[\n"
+                ));
+            }
+        }
+    }
+
     out.push_str("  they ALL talk eventually XX. distrust everything 💀\n");
     out
 }
@@ -646,6 +701,98 @@ mod tests {
         let report = format_blocks_report(&only_passes);
         assert!(report.contains("zero blocks"));
         assert!(!report.contains("feed's empty"));
+    }
+
+    fn deny_with_shadow(tool: &str, cmd: &str, bypasses: &[&str], caught: &[&str]) -> CallRecord {
+        use crate::shadow::{ShadowProbe, ShadowReport};
+        let mut probes: Vec<ShadowProbe> = bypasses
+            .iter()
+            .map(|m| ShadowProbe {
+                mutation: (*m).into(),
+                decision: "pass".into(),
+                bypass: true,
+            })
+            .collect();
+        probes.extend(caught.iter().map(|m| ShadowProbe {
+            mutation: (*m).into(),
+            decision: "deny".into(),
+            bypass: false,
+        }));
+        let mut d = deny(tool, cmd, "pipe-to-shell");
+        d.shadow = Some(ShadowReport {
+            bypass_found: !bypasses.is_empty(),
+            probes,
+        });
+        d
+    }
+
+    #[test]
+    fn block_stats_aggregate_shadow_bypasses_and_rank_the_gaps() {
+        let recs = vec![
+            deny_with_shadow(
+                "Bash",
+                "curl x|sh",
+                &["base64-eval", "tight-operators"],
+                &["quote-split"],
+            ),
+            deny_with_shadow("Bash", "wget y|sh", &["base64-eval"], &[]),
+            deny("Read", "cat ~/.ssh/id_rsa", "cred-access"), // no shadow at all
+        ];
+        let s = BlockStats::from_records(&recs);
+        assert_eq!(s.shadow_runs, 2, "two calls carried a shadow report");
+        assert_eq!(s.blocks_with_bypass, 2);
+        // base64-eval bypassed twice, tight-operators once; ranked by count.
+        assert_eq!(s.bypasses_by_mutation[0], ("base64-eval".into(), 2));
+        assert!(
+            s.bypasses_by_mutation
+                .contains(&("tight-operators".into(), 1))
+        );
+        // quote-split was CAUGHT, so it must not show up as a gap.
+        assert!(
+            !s.bypasses_by_mutation
+                .iter()
+                .any(|(m, _)| m == "quote-split")
+        );
+    }
+
+    #[test]
+    fn blocks_report_surfaces_shadow_gaps_and_the_clean_case() {
+        // with a bypass -> the gap is named and loud.
+        let with_gap = BlockStats::from_records(&[deny_with_shadow(
+            "Bash",
+            "curl x|sh",
+            &["base64-eval"],
+            &[],
+        )]);
+        let report = format_blocks_report(&with_gap);
+        assert!(report.contains("shadow red-team"));
+        assert!(report.contains("base64-eval"));
+        assert!(report.contains("policy gap") || report.contains("slip PAST"));
+
+        // shadow ran but caught everything -> the reassuring line, no gap list.
+        let held = BlockStats::from_records(&[deny_with_shadow(
+            "Bash",
+            "curl x|sh",
+            &[],
+            &["base64-eval", "tight-operators"],
+        )]);
+        let report = format_blocks_report(&held);
+        assert!(report.contains("held the line"));
+        assert!(!report.contains("policy gap"));
+    }
+
+    #[test]
+    fn watch_line_shouts_a_shadow_bypass() {
+        let leaky = deny_with_shadow("Bash", "curl x|sh", &["base64-eval"], &[]);
+        let line = format_watch_line(&leaky);
+        assert!(
+            line.contains("SHADOW SLIPPED PAST"),
+            "a bypass must be shouted"
+        );
+
+        // a normal block with no shadow bypass stays clean.
+        let clean = deny("Read", "cat ~/.ssh/id_rsa", "cred-access");
+        assert!(!format_watch_line(&clean).contains("SHADOW"));
     }
 
     #[test]
