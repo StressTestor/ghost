@@ -413,12 +413,12 @@ pub fn format_blocks_report(stats: &BlockStats) -> String {
             );
         } else {
             out.push_str(&format!(
-                "    💀 {} blocked call(s) had an evasion slip PAST sentinel — real policy gaps:\n",
+                "    💀 {} blocked call(s) had an evasion sentinel DIDN'T catch — candidate bypasses, verify:\n",
                 stats.blocks_with_bypass
             ));
             for (mutation, n) in &stats.bypasses_by_mutation {
                 out.push_str(&format!(
-                    "      {mutation}: bypassed {n}x — patch this or they walk right in >:[\n"
+                    "      {mutation}: passed {n}x — confirm it still does the deed, then patch the policy >:[\n"
                 ));
             }
         }
@@ -822,9 +822,12 @@ mod tests {
         let report = format_blocks_report(&with_gap);
         assert!(report.contains("shadow red-team"));
         assert!(report.contains("base64-eval"));
-        assert!(report.contains("policy gap") || report.contains("slip PAST"));
+        assert!(
+            report.contains("candidate bypass") || report.contains("DIDN'T catch"),
+            "names the evasions honestly as candidates to verify: {report}"
+        );
 
-        // shadow ran but caught everything -> the reassuring line, no gap list.
+        // shadow ran but caught everything -> the reassuring line, no candidate list.
         let held = BlockStats::from_records(&[deny_with_shadow(
             "Bash",
             "curl x|sh",
@@ -833,7 +836,7 @@ mod tests {
         )]);
         let report = format_blocks_report(&held);
         assert!(report.contains("held the line"));
-        assert!(!report.contains("policy gap"));
+        assert!(!report.contains("candidate bypass"));
     }
 
     #[test]

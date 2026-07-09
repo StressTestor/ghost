@@ -129,7 +129,7 @@ pub fn run_bridge(
 
     match oracle.evaluate(&payload_for_sentinel) {
         Ok(SentinelDecision::Deny { reason }) => {
-            let category = BlockCategory::classify(&tool_name, &reason, &command);
+            let category = BlockCategory::classify(&reason, &command);
             let roast = engine.produce_block_roast(&tool_name, &command, category, recent_ids);
             // RULE 1/2: it's a deny in, it's a deny out. we only decorate the reason.
             let final_reason = if cfg.narrate_to_agent {
