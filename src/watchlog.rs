@@ -36,6 +36,12 @@ pub struct CallRecord {
     /// this field existed still parse (-> None).
     #[serde(default)]
     pub roast_id: Option<String>,
+    /// shadow-attack findings, only when the hook ran in shadow mode and had
+    /// something to probe. `skip_serializing_if` keeps the overwhelming majority of
+    /// feed lines (observe-mode passes + denies) byte-for-byte unchanged, and
+    /// `default` means every older line still parses. 🔬
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow: Option<crate::shadow::ShadowReport>,
 }
 
 impl CallRecord {
@@ -50,6 +56,7 @@ impl CallRecord {
             category: outcome.category.map(category_label),
             roast: outcome.block_event.clone(),
             roast_id: outcome.roast_id.clone(),
+            shadow: outcome.shadow.clone(),
         }
     }
 
@@ -356,6 +363,7 @@ mod tests {
             command: "cat ~/.ssh/id_rsa".into(),
             category: Some(BlockCategory::CredAccess),
             roast_id: Some("cred-access:2".into()),
+            shadow: None,
         }
     }
 
@@ -369,6 +377,7 @@ mod tests {
             command: "ls -la".into(),
             category: None,
             roast_id: None,
+            shadow: None,
         }
     }
 
@@ -584,6 +593,7 @@ mod tests {
             category: Some(cat.into()),
             roast: Some("blocked 💀".into()),
             roast_id: Some(format!("{cat}:0")),
+            shadow: None,
         }
     }
     fn pass(tool: &str, cmd: &str) -> CallRecord {
@@ -595,6 +605,7 @@ mod tests {
             category: None,
             roast: None,
             roast_id: None,
+            shadow: None,
         }
     }
 
@@ -665,6 +676,7 @@ mod tests {
             category: Some("cred-access".into()),
             roast: Some("blocked".into()),
             roast_id: Some(id.into()),
+            shadow: None,
         };
         append_call_to(&path, &mk_block("cred-access:0"));
         append_call_to(&path, &pass_call()); // a pass in the middle

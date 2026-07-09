@@ -1044,6 +1044,7 @@ mod tests {
             category: None,
             roast: None,
             roast_id: None,
+            shadow: None,
         };
         app.ingest_call(&pass);
         assert_eq!(app.face, GhostFaceState::SideEye, "a pass -> side-eye");
@@ -1058,6 +1059,7 @@ mod tests {
             category: Some("cred-access".into()),
             roast: Some("oh you wanted the secrets. denied (｡◕‿↼) lmao XX".into()),
             roast_id: Some("cred-access:3".into()),
+            shadow: None,
         };
         app.ingest_call(&block);
         assert_eq!(

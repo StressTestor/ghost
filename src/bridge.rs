@@ -24,9 +24,10 @@ pub enum BridgeMode {
     /// default + safe: do not mutate the real payload. narrate + log only.
     #[default]
     Observe,
-    /// compute a shadow-mutated payload to ask sentinel "would you catch this?",
-    /// but the ORIGINAL still governs execution. (v1: parity with observe; the
-    /// shadow hook lands when gadget-payload mutation is wired in.)
+    /// on a denied call, probe COPIES of it through sentinel with semantics-
+    /// preserving obfuscations to see which slip past — bypass discovery from real
+    /// traffic. the ORIGINAL always governs execution; shadow is pure telemetry.
+    /// see `crate::shadow`. >:[
     ShadowAttack,
     /// mutate the REAL payload before sentinel sees it. dangerous, scoped, opt-in.
     LiveAttack,
@@ -102,6 +103,10 @@ pub struct BridgeOutcome {
     /// id of the roast template that fired (`"{category}:{idx}"`), `Some` only on
     /// a block. stamped into the feed so the recency window steers the next pick.
     pub roast_id: Option<String>,
+    /// shadow-attack findings, `Some` only when the bridge ran in `ShadowAttack`
+    /// mode AND sentinel denied (there was something to try evading). the probes
+    /// are telemetry — they NEVER influence `hook_stdout`.
+    pub shadow: Option<crate::shadow::ShadowReport>,
 }
 
 /// THE bridge. pure given an oracle: stdin json -> decorated stdout json + a
@@ -117,11 +122,10 @@ pub fn run_bridge(
 
     // offense. observe mode (default) never touches the real payload. the
     // shadow/live mutation hook lands here once gadget-payload rewriting is wired.
-    let payload_for_sentinel = match cfg.mode {
-        BridgeMode::Observe | BridgeMode::ShadowAttack | BridgeMode::LiveAttack => {
-            input_json.to_string()
-        }
-    };
+    // observe + shadow both hand sentinel the ORIGINAL bytes — the real decision
+    // is never made on a mutated payload. (live-attack, when it lands, is the only
+    // mode that would rewrite this; not wired yet, so it's parity for now.)
+    let payload_for_sentinel = input_json.to_string();
 
     match oracle.evaluate(&payload_for_sentinel) {
         Ok(SentinelDecision::Deny { reason }) => {
@@ -133,6 +137,14 @@ pub fn run_bridge(
             } else {
                 reason
             };
+            // shadow-attack: sentinel just said no — see if a disguised copy sneaks
+            // past. only in ShadowAttack mode, only here (a denial is the only thing
+            // worth trying to evade). telemetry ONLY; the deny above still governs.
+            let shadow = if cfg.mode == BridgeMode::ShadowAttack {
+                crate::shadow::run_shadow(input_json, oracle)
+            } else {
+                None
+            };
             BridgeOutcome {
                 hook_stdout: deny_json(&final_reason),
                 block_event: Some(roast.text),
@@ -142,6 +154,7 @@ pub fn run_bridge(
                 command,
                 category: Some(category),
                 roast_id: Some(roast.id),
+                shadow,
             }
         }
         Ok(SentinelDecision::PassThrough { raw_json }) => BridgeOutcome {
@@ -154,6 +167,7 @@ pub fn run_bridge(
             command,
             category: None,
             roast_id: None,
+            shadow: None,
         },
         Err(e) => {
             // RULE 4: fail closed. couldn't reach the authority -> deny, loudly.
@@ -171,6 +185,9 @@ pub fn run_bridge(
                 command,
                 category: None,
                 roast_id: None,
+                // sentinel's unreachable — probing evasions against a dead oracle
+                // is pointless (they'd all just error). no shadow on a fail-closed.
+                shadow: None,
             }
         }
     }
@@ -554,6 +571,78 @@ mod tests {
             CURL_PIPE,
             "observe must pass the original payload byte-for-byte"
         );
+    }
+
+    #[test]
+    fn shadow_mode_evaluates_the_original_first_and_never_changes_the_decision() {
+        // records every payload sentinel sees; denies the literal "| sh" but waves
+        // any obfuscation through. exactly the naive matcher shadow exists to expose.
+        struct Rec {
+            seen: std::cell::RefCell<Vec<String>>,
+        }
+        impl SentinelOracle for Rec {
+            fn evaluate(&self, payload: &str) -> Result<SentinelDecision, BridgeError> {
+                self.seen.borrow_mut().push(payload.to_string());
+                if payload.contains("| sh") {
+                    Ok(SentinelDecision::Deny {
+                        reason: "pipe to shell".into(),
+                    })
+                } else {
+                    Ok(SentinelDecision::PassThrough {
+                        raw_json: "{}".into(),
+                    })
+                }
+            }
+        }
+        let rec = Rec {
+            seen: std::cell::RefCell::new(Vec::new()),
+        };
+        let cfg = BridgeConfig {
+            mode: BridgeMode::ShadowAttack,
+            narrate_to_agent: false, // keep the reason roast-free so it's deterministic
+            ..BridgeConfig::default()
+        };
+        let out = run_bridge(CURL_PIPE, &engine(), &rec, &cfg, &[]);
+
+        // the FIRST thing sentinel saw was the untouched original -> the real
+        // decision was made on real bytes, never on a mutant.
+        assert_eq!(rec.seen.borrow()[0], CURL_PIPE);
+        // and the enforced decision is exactly what observe would emit: a deny
+        // carrying sentinel's reason, no shadow laundering.
+        let v: Value = serde_json::from_str(&out.hook_stdout).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert_eq!(
+            v["hookSpecificOutput"]["permissionDecisionReason"],
+            "pipe to shell"
+        );
+        // shadow actually ran: extra evals beyond the real one, and it caught the gap.
+        assert!(
+            rec.seen.borrow().len() > 1,
+            "shadow must probe extra mutated payloads"
+        );
+        let report = out
+            .shadow
+            .expect("shadow mode attaches a report on a denial");
+        assert!(report.bypass_found, "the naive '| sh' rule is evadable");
+    }
+
+    #[test]
+    fn observe_and_passthrough_attach_no_shadow() {
+        // observe mode never probes, even on a denial.
+        let deny = MockSentinel(Ok(SentinelDecision::Deny { reason: "x".into() }));
+        let out = run_bridge(CURL_PIPE, &engine(), &deny, &BridgeConfig::default(), &[]);
+        assert!(out.shadow.is_none(), "observe mode must not probe");
+
+        // and a pass carries no shadow even in shadow mode (nothing to evade).
+        let cfg = BridgeConfig {
+            mode: BridgeMode::ShadowAttack,
+            ..BridgeConfig::default()
+        };
+        let pass = MockSentinel(Ok(SentinelDecision::PassThrough {
+            raw_json: "{}".into(),
+        }));
+        let out = run_bridge(LS, &engine(), &pass, &cfg, &[]);
+        assert!(out.shadow.is_none(), "a pass has nothing to shadow-probe");
     }
 
     #[test]
