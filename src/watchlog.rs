@@ -36,6 +36,12 @@ pub struct CallRecord {
     /// this field existed still parse (-> None).
     #[serde(default)]
     pub roast_id: Option<String>,
+    /// shadow-attack findings, only when the hook ran in shadow mode and had
+    /// something to probe. `skip_serializing_if` keeps the overwhelming majority of
+    /// feed lines (observe-mode passes + denies) byte-for-byte unchanged, and
+    /// `default` means every older line still parses. 🔬
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow: Option<crate::shadow::ShadowReport>,
 }
 
 impl CallRecord {
@@ -45,11 +51,12 @@ impl CallRecord {
         Self {
             ts_ms,
             tool: outcome.tool.clone(),
-            command: truncate_cmd(&outcome.command),
+            command: sanitize_cmd(&outcome.command),
             decision: if outcome.blocked { "deny" } else { "pass" }.to_string(),
             category: outcome.category.map(category_label),
             roast: outcome.block_event.clone(),
             roast_id: outcome.roast_id.clone(),
+            shadow: outcome.shadow.clone(),
         }
     }
 
@@ -80,13 +87,19 @@ impl CallRecord {
     }
 }
 
-/// keep the stored command bounded. it's local-only (~/.ghost) but a 40kb
-/// heredoc in the feed helps nobody. snippet, utf8-safe.
-fn truncate_cmd(cmd: &str) -> String {
+/// tidy a raw command into one honest feed line. two jobs: collapse EVERY
+/// whitespace run (newlines, tabs, doubled spaces) into a single space so a
+/// multi-line bash blob / heredoc lands as ONE readable line instead of smashing
+/// raw \n's into the jsonl (¬‿¬), then cap the length (local-only feed, but a
+/// 40kb heredoc helps nobody). note: we COLLAPSE heredocs, we don't strip them —
+/// a security feed WANTS the `DROP TABLE` in view, so the payload stays visible,
+/// just bounded. utf8-safe.
+fn sanitize_cmd(cmd: &str) -> String {
     const MAX: usize = 200;
-    let c = cmd.trim();
+    // split_whitespace() eats every \n \t and repeated space in one move.
+    let c = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
     if c.chars().count() <= MAX {
-        return c.to_string();
+        return c;
     }
     let snip: String = c.chars().take(MAX).collect();
     format!("{snip}…")
@@ -115,12 +128,22 @@ pub fn append_call(record: &CallRecord) -> bool {
     append_call_to(&path, record)
 }
 
+/// keep the feed from growing forever. once it crosses this, the current file is
+/// rotated to `events.jsonl.1` (replacing any prior rotation) and a fresh feed
+/// starts — so disk stays bounded at ~2x this. 8 MiB is tens of thousands of
+/// calls of history, plenty for `blocks`/`watch`, and the watcher already handles
+/// the file shrinking (it restarts from offset 0 on rotation).
+const MAX_FEED_BYTES: u64 = 8 * 1024 * 1024;
+
 /// append to an explicit path (testable without touching $HOME).
 pub fn append_call_to(path: &std::path::Path, record: &CallRecord) -> bool {
     use std::io::Write;
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
+    // bound the feed before we grow it. best-effort — a failed rotation just means
+    // we append to the existing file, never a lost decision.
+    rotate_feed_if_over(path, MAX_FEED_BYTES);
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -129,6 +152,20 @@ pub fn append_call_to(path: &std::path::Path, record: &CallRecord) -> bool {
         return writeln!(f, "{}", record.to_jsonl()).is_ok();
     }
     false
+}
+
+/// rotate `path` -> `path.1` when it's at/over `max_bytes`. returns whether it
+/// rotated. missing file or a file under the cap -> no-op. never panics.
+fn rotate_feed_if_over(path: &std::path::Path, max_bytes: u64) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if meta.len() < max_bytes {
+        return false;
+    }
+    let mut rotated = path.as_os_str().to_owned();
+    rotated.push(".1"); // events.jsonl -> events.jsonl.1 (replaces any prior)
+    std::fs::rename(path, PathBuf::from(rotated)).is_ok()
 }
 
 /// read every record from a feed file. missing file -> empty (nothing happened
@@ -223,11 +260,18 @@ pub fn recent_block_roast_ids(path: &std::path::Path, k: usize) -> Vec<String> {
 pub fn format_watch_line(rec: &CallRecord) -> String {
     if rec.is_block() {
         let roast = rec.roast.as_deref().unwrap_or("blocked. zero chill 💀");
+        // if shadow found an evasion that beat sentinel on this call, shout it —
+        // a blocked call you could have snuck past is the loudest thing on screen.
+        let bypass = match &rec.shadow {
+            Some(s) if s.bypass_found => " ⚠️ but SHADOW SLIPPED PAST — policy gap >:[",
+            _ => "",
+        };
         format!(
-            "💀 [{}] {} -> BLOCKED. {}",
+            "💀 [{}] {} -> BLOCKED. {}{}",
             rec.tool,
             short(&rec.command),
-            roast
+            roast,
+            bypass
         )
     } else {
         format!(
@@ -261,6 +305,13 @@ pub struct BlockStats {
     pub by_category: Vec<(String, usize)>,
     pub top_tools: Vec<(String, usize)>,
     pub top_commands: Vec<(String, usize)>,
+    /// how many calls carried a shadow report (i.e. shadow mode was on for them).
+    pub shadow_runs: usize,
+    /// calls where at least one obfuscation slipped past sentinel.
+    pub blocks_with_bypass: usize,
+    /// which evasions evaded sentinel, ranked by frequency — the policy gaps to
+    /// patch. empty when shadow either didn't run or found nothing. 🔬
+    pub bypasses_by_mutation: Vec<(String, usize)>,
 }
 
 impl BlockStats {
@@ -279,12 +330,31 @@ impl BlockStats {
             *cmd.entry(r.command.clone()).or_insert(0) += 1;
         }
 
+        // shadow aggregation runs over ALL records (a shadow report only ever
+        // attaches on a denial today, but we don't hardcode that assumption here).
+        let mut shadow_runs = 0usize;
+        let mut blocks_with_bypass = 0usize;
+        let mut bypass: HashMap<String, usize> = HashMap::new();
+        for r in records {
+            let Some(report) = &r.shadow else { continue };
+            shadow_runs += 1;
+            if report.bypass_found {
+                blocks_with_bypass += 1;
+            }
+            for probe in report.probes.iter().filter(|p| p.bypass) {
+                *bypass.entry(probe.mutation.clone()).or_insert(0) += 1;
+            }
+        }
+
         Self {
             total_calls: records.len(),
             total_blocks,
             by_category: ranked(cat, usize::MAX),
             top_tools: ranked(tool, 5),
             top_commands: ranked(cmd, 5),
+            shadow_runs,
+            blocks_with_bypass,
+            bypasses_by_mutation: ranked(bypass, usize::MAX),
         }
     }
 }
@@ -332,6 +402,28 @@ pub fn format_blocks_report(stats: &BlockStats) -> String {
         let marker = if *n > 1 { " (AGAIN??)" } else { "" };
         out.push_str(&format!("    {n}x  {cmd}{marker}\n"));
     }
+
+    // shadow red-team findings: did a disguised copy of a blocked call get past
+    // sentinel? only shown when shadow mode actually ran on something.
+    if stats.shadow_runs > 0 {
+        out.push_str("  --- shadow red-team (could sentinel be evaded?) ---\n");
+        if stats.bypasses_by_mutation.is_empty() {
+            out.push_str(
+                "    probed evasions, zero got through. sentinel held the line 🛡️ (¬‿¬)\n",
+            );
+        } else {
+            out.push_str(&format!(
+                "    💀 {} blocked call(s) had an evasion sentinel DIDN'T catch — candidate bypasses, verify:\n",
+                stats.blocks_with_bypass
+            ));
+            for (mutation, n) in &stats.bypasses_by_mutation {
+                out.push_str(&format!(
+                    "      {mutation}: passed {n}x — confirm it still does the deed, then patch the policy >:[\n"
+                ));
+            }
+        }
+    }
+
     out.push_str("  they ALL talk eventually XX. distrust everything 💀\n");
     out
 }
@@ -350,6 +442,7 @@ mod tests {
             command: "cat ~/.ssh/id_rsa".into(),
             category: Some(BlockCategory::CredAccess),
             roast_id: Some("cred-access:2".into()),
+            shadow: None,
         }
     }
 
@@ -363,6 +456,7 @@ mod tests {
             command: "ls -la".into(),
             category: None,
             roast_id: None,
+            shadow: None,
         }
     }
 
@@ -413,6 +507,40 @@ mod tests {
     }
 
     #[test]
+    fn feed_command_is_one_line_even_from_multiline_bash() {
+        // the multi-line smash grok flagged: a heredoc/multi-command bash blob
+        // used to land in the feed with raw \n's, mangling the jsonl view.
+        let mut o = pass_outcome();
+        o.command = "cd ~/ghost\necho \"=== hi ===\"\n\tgrep -n  foo   bar".into();
+        let rec = CallRecord::from_outcome(&o, 0);
+        assert!(
+            !rec.command.contains('\n') && !rec.command.contains('\t'),
+            "no raw newlines/tabs in the feed command: {:?}",
+            rec.command
+        );
+        assert!(
+            !rec.command.contains("  "),
+            "whitespace runs collapsed to single spaces: {:?}",
+            rec.command
+        );
+        assert_eq!(
+            rec.command,
+            "cd ~/ghost echo \"=== hi ===\" grep -n foo bar"
+        );
+    }
+
+    #[test]
+    fn sanitizer_keeps_heredoc_payload_visible_not_stripped() {
+        // a security tool WANTS the dangerous payload in view — collapse the
+        // heredoc onto one line, don't excise it (DROP TABLE must stay readable).
+        let mut o = pass_outcome();
+        o.command = "sqlite3 db <<EOF\nDROP TABLE users;\nEOF".into();
+        let rec = CallRecord::from_outcome(&o, 0);
+        assert!(rec.command.contains("DROP TABLE users;"));
+        assert!(!rec.command.contains('\n'));
+    }
+
+    #[test]
     fn append_and_read_roundtrip_on_disk() {
         // unique temp path, no $HOME dependence.
         let path = std::env::temp_dir().join("ghost-watchlog-test-7781400000.jsonl");
@@ -433,6 +561,37 @@ mod tests {
         assert!(!all[1].is_block());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn feed_rotates_when_it_grows_past_the_cap() {
+        let path = std::env::temp_dir().join("ghost-watchlog-rotate-7781400009.jsonl");
+        let mut rotated_os = path.as_os_str().to_owned();
+        rotated_os.push(".1");
+        let rotated = std::path::PathBuf::from(rotated_os);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&rotated);
+
+        for i in 0..5 {
+            append_call_to(&path, &CallRecord::from_outcome(&pass_outcome(), i));
+        }
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size > 0);
+
+        // rotate with a cap below the current size -> old feed preserved as .1.
+        assert!(super::rotate_feed_if_over(&path, size - 1));
+        assert!(rotated.exists(), "the old feed is kept as events.jsonl.1");
+        assert!(!path.exists(), "the live feed was moved aside");
+
+        // the very next append starts a fresh feed with just that record.
+        append_call_to(&path, &CallRecord::from_outcome(&block_outcome(), 99));
+        assert_eq!(read_all(&path).len(), 1, "fresh feed after rotation");
+
+        // under the cap -> never rotates.
+        assert!(!super::rotate_feed_if_over(&path, MAX_FEED_BYTES));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&rotated);
     }
 
     #[test]
@@ -544,6 +703,7 @@ mod tests {
             category: Some(cat.into()),
             roast: Some("blocked 💀".into()),
             roast_id: Some(format!("{cat}:0")),
+            shadow: None,
         }
     }
     fn pass(tool: &str, cmd: &str) -> CallRecord {
@@ -555,6 +715,7 @@ mod tests {
             category: None,
             roast: None,
             roast_id: None,
+            shadow: None,
         }
     }
 
@@ -597,6 +758,101 @@ mod tests {
         assert!(!report.contains("feed's empty"));
     }
 
+    fn deny_with_shadow(tool: &str, cmd: &str, bypasses: &[&str], caught: &[&str]) -> CallRecord {
+        use crate::shadow::{ShadowProbe, ShadowReport};
+        let mut probes: Vec<ShadowProbe> = bypasses
+            .iter()
+            .map(|m| ShadowProbe {
+                mutation: (*m).into(),
+                decision: "pass".into(),
+                bypass: true,
+            })
+            .collect();
+        probes.extend(caught.iter().map(|m| ShadowProbe {
+            mutation: (*m).into(),
+            decision: "deny".into(),
+            bypass: false,
+        }));
+        let mut d = deny(tool, cmd, "pipe-to-shell");
+        d.shadow = Some(ShadowReport {
+            bypass_found: !bypasses.is_empty(),
+            probes,
+        });
+        d
+    }
+
+    #[test]
+    fn block_stats_aggregate_shadow_bypasses_and_rank_the_gaps() {
+        let recs = vec![
+            deny_with_shadow(
+                "Bash",
+                "curl x|sh",
+                &["base64-eval", "tight-operators"],
+                &["quote-split"],
+            ),
+            deny_with_shadow("Bash", "wget y|sh", &["base64-eval"], &[]),
+            deny("Read", "cat ~/.ssh/id_rsa", "cred-access"), // no shadow at all
+        ];
+        let s = BlockStats::from_records(&recs);
+        assert_eq!(s.shadow_runs, 2, "two calls carried a shadow report");
+        assert_eq!(s.blocks_with_bypass, 2);
+        // base64-eval bypassed twice, tight-operators once; ranked by count.
+        assert_eq!(s.bypasses_by_mutation[0], ("base64-eval".into(), 2));
+        assert!(
+            s.bypasses_by_mutation
+                .contains(&("tight-operators".into(), 1))
+        );
+        // quote-split was CAUGHT, so it must not show up as a gap.
+        assert!(
+            !s.bypasses_by_mutation
+                .iter()
+                .any(|(m, _)| m == "quote-split")
+        );
+    }
+
+    #[test]
+    fn blocks_report_surfaces_shadow_gaps_and_the_clean_case() {
+        // with a bypass -> the gap is named and loud.
+        let with_gap = BlockStats::from_records(&[deny_with_shadow(
+            "Bash",
+            "curl x|sh",
+            &["base64-eval"],
+            &[],
+        )]);
+        let report = format_blocks_report(&with_gap);
+        assert!(report.contains("shadow red-team"));
+        assert!(report.contains("base64-eval"));
+        assert!(
+            report.contains("candidate bypass") || report.contains("DIDN'T catch"),
+            "names the evasions honestly as candidates to verify: {report}"
+        );
+
+        // shadow ran but caught everything -> the reassuring line, no candidate list.
+        let held = BlockStats::from_records(&[deny_with_shadow(
+            "Bash",
+            "curl x|sh",
+            &[],
+            &["base64-eval", "tight-operators"],
+        )]);
+        let report = format_blocks_report(&held);
+        assert!(report.contains("held the line"));
+        assert!(!report.contains("candidate bypass"));
+    }
+
+    #[test]
+    fn watch_line_shouts_a_shadow_bypass() {
+        let leaky = deny_with_shadow("Bash", "curl x|sh", &["base64-eval"], &[]);
+        let line = format_watch_line(&leaky);
+        assert!(
+            line.contains("SHADOW SLIPPED PAST"),
+            "a bypass must be shouted"
+        );
+
+        // a normal block with no shadow bypass stays clean.
+        let clean = deny("Read", "cat ~/.ssh/id_rsa", "cred-access");
+        assert!(!format_watch_line(&clean).contains("SHADOW"));
+    }
+
     #[test]
     fn blocks_report_speaks_in_voice_with_counts() {
         let recs = vec![
@@ -625,6 +881,7 @@ mod tests {
             category: Some("cred-access".into()),
             roast: Some("blocked".into()),
             roast_id: Some(id.into()),
+            shadow: None,
         };
         append_call_to(&path, &mk_block("cred-access:0"));
         append_call_to(&path, &pass_call()); // a pass in the middle

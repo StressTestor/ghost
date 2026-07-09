@@ -15,6 +15,7 @@ pub mod gadgets;
 pub mod interceptor;
 pub mod personality;
 pub mod session;
+pub mod shadow;
 pub mod tui;
 pub mod watchlog;
 
