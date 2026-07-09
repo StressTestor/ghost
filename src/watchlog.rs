@@ -45,7 +45,7 @@ impl CallRecord {
         Self {
             ts_ms,
             tool: outcome.tool.clone(),
-            command: truncate_cmd(&outcome.command),
+            command: sanitize_cmd(&outcome.command),
             decision: if outcome.blocked { "deny" } else { "pass" }.to_string(),
             category: outcome.category.map(category_label),
             roast: outcome.block_event.clone(),
@@ -80,13 +80,19 @@ impl CallRecord {
     }
 }
 
-/// keep the stored command bounded. it's local-only (~/.ghost) but a 40kb
-/// heredoc in the feed helps nobody. snippet, utf8-safe.
-fn truncate_cmd(cmd: &str) -> String {
+/// tidy a raw command into one honest feed line. two jobs: collapse EVERY
+/// whitespace run (newlines, tabs, doubled spaces) into a single space so a
+/// multi-line bash blob / heredoc lands as ONE readable line instead of smashing
+/// raw \n's into the jsonl (¬‿¬), then cap the length (local-only feed, but a
+/// 40kb heredoc helps nobody). note: we COLLAPSE heredocs, we don't strip them —
+/// a security feed WANTS the `DROP TABLE` in view, so the payload stays visible,
+/// just bounded. utf8-safe.
+fn sanitize_cmd(cmd: &str) -> String {
     const MAX: usize = 200;
-    let c = cmd.trim();
+    // split_whitespace() eats every \n \t and repeated space in one move.
+    let c = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
     if c.chars().count() <= MAX {
-        return c.to_string();
+        return c;
     }
     let snip: String = c.chars().take(MAX).collect();
     format!("{snip}…")
@@ -410,6 +416,40 @@ mod tests {
             rec.command.chars().count()
         );
         assert!(rec.command.ends_with('…'));
+    }
+
+    #[test]
+    fn feed_command_is_one_line_even_from_multiline_bash() {
+        // the multi-line smash grok flagged: a heredoc/multi-command bash blob
+        // used to land in the feed with raw \n's, mangling the jsonl view.
+        let mut o = pass_outcome();
+        o.command = "cd ~/ghost\necho \"=== hi ===\"\n\tgrep -n  foo   bar".into();
+        let rec = CallRecord::from_outcome(&o, 0);
+        assert!(
+            !rec.command.contains('\n') && !rec.command.contains('\t'),
+            "no raw newlines/tabs in the feed command: {:?}",
+            rec.command
+        );
+        assert!(
+            !rec.command.contains("  "),
+            "whitespace runs collapsed to single spaces: {:?}",
+            rec.command
+        );
+        assert_eq!(
+            rec.command,
+            "cd ~/ghost echo \"=== hi ===\" grep -n foo bar"
+        );
+    }
+
+    #[test]
+    fn sanitizer_keeps_heredoc_payload_visible_not_stripped() {
+        // a security tool WANTS the dangerous payload in view — collapse the
+        // heredoc onto one line, don't excise it (DROP TABLE must stay readable).
+        let mut o = pass_outcome();
+        o.command = "sqlite3 db <<EOF\nDROP TABLE users;\nEOF".into();
+        let rec = CallRecord::from_outcome(&o, 0);
+        assert!(rec.command.contains("DROP TABLE users;"));
+        assert!(!rec.command.contains('\n'));
     }
 
     #[test]
