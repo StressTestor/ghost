@@ -531,6 +531,78 @@ mod tests {
     }
 
     #[test]
+    fn hook_stdout_is_always_valid_json_and_never_an_allow() {
+        // THE load-bearing hook contract: claude code parses our stdout as the
+        // decision. whatever the mode, whatever sentinel says, however junk the
+        // payload — stdout must be parseable JSON and must NEVER fabricate an allow
+        // (that would auto-approve a call + skip the user's prompt). this is the
+        // regression wall: if a refactor ever leaks a roast onto stdout, this fails.
+        enum Kind {
+            Deny,
+            Pass,
+            PassGarbage,
+            Down,
+        }
+        fn oracle_for(k: &Kind) -> MockSentinel {
+            match k {
+                Kind::Deny => MockSentinel(Ok(SentinelDecision::Deny {
+                    reason: "blocked: rm -rf /".into(),
+                })),
+                Kind::Pass => MockSentinel(Ok(SentinelDecision::PassThrough {
+                    raw_json: "{}".into(),
+                })),
+                // sentinel returned non-JSON on a non-deny -> we must still emit clean json.
+                Kind::PassGarbage => MockSentinel(Ok(SentinelDecision::PassThrough {
+                    raw_json: "total garbage not json".into(),
+                })),
+                Kind::Down => MockSentinel(Err(BridgeError::Unreachable("down".into()))),
+            }
+        }
+
+        let payloads = [
+            CURL_PIPE,
+            LS,
+            r#"{"tool_name":"Read","tool_input":{"file_path":"~/.ssh/id_rsa"}}"#,
+            "not even json",
+            "{}",
+        ];
+        let modes = [
+            BridgeMode::Observe,
+            BridgeMode::ShadowAttack,
+            BridgeMode::LiveAttack,
+        ];
+        let kinds = [Kind::Deny, Kind::Pass, Kind::PassGarbage, Kind::Down];
+
+        for mode in modes {
+            for payload in payloads {
+                for kind in &kinds {
+                    let oracle = oracle_for(kind);
+                    let cfg = BridgeConfig {
+                        mode,
+                        ..BridgeConfig::default()
+                    };
+                    let out = run_bridge(payload, &engine(), &oracle, &cfg, &[]);
+                    // 1. stdout ALWAYS parses as JSON.
+                    let v: Value = serde_json::from_str(&out.hook_stdout).unwrap_or_else(|e| {
+                        panic!(
+                            "stdout not JSON (mode={mode:?}, payload={payload:?}): {e}\n{}",
+                            out.hook_stdout
+                        )
+                    });
+                    // 2. never a fabricated allow, in the field or anywhere in the text.
+                    assert_ne!(
+                        v.pointer("/hookSpecificOutput/permissionDecision")
+                            .and_then(|x| x.as_str()),
+                        Some("allow"),
+                        "fabricated an allow (mode={mode:?}, payload={payload:?})"
+                    );
+                    assert!(!out.hook_stdout.contains("\"allow\""));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn parses_real_sentinel_wire_shapes() {
         // the exact shapes from sentinel-audit tests/hook_contract.rs
         let deny = r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"pipe to shell execution"}}"#;

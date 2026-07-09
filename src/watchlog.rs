@@ -128,12 +128,22 @@ pub fn append_call(record: &CallRecord) -> bool {
     append_call_to(&path, record)
 }
 
+/// keep the feed from growing forever. once it crosses this, the current file is
+/// rotated to `events.jsonl.1` (replacing any prior rotation) and a fresh feed
+/// starts — so disk stays bounded at ~2x this. 8 MiB is tens of thousands of
+/// calls of history, plenty for `blocks`/`watch`, and the watcher already handles
+/// the file shrinking (it restarts from offset 0 on rotation).
+const MAX_FEED_BYTES: u64 = 8 * 1024 * 1024;
+
 /// append to an explicit path (testable without touching $HOME).
 pub fn append_call_to(path: &std::path::Path, record: &CallRecord) -> bool {
     use std::io::Write;
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
+    // bound the feed before we grow it. best-effort — a failed rotation just means
+    // we append to the existing file, never a lost decision.
+    rotate_feed_if_over(path, MAX_FEED_BYTES);
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -142,6 +152,20 @@ pub fn append_call_to(path: &std::path::Path, record: &CallRecord) -> bool {
         return writeln!(f, "{}", record.to_jsonl()).is_ok();
     }
     false
+}
+
+/// rotate `path` -> `path.1` when it's at/over `max_bytes`. returns whether it
+/// rotated. missing file or a file under the cap -> no-op. never panics.
+fn rotate_feed_if_over(path: &std::path::Path, max_bytes: u64) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if meta.len() < max_bytes {
+        return false;
+    }
+    let mut rotated = path.as_os_str().to_owned();
+    rotated.push(".1"); // events.jsonl -> events.jsonl.1 (replaces any prior)
+    std::fs::rename(path, PathBuf::from(rotated)).is_ok()
 }
 
 /// read every record from a feed file. missing file -> empty (nothing happened
@@ -537,6 +561,37 @@ mod tests {
         assert!(!all[1].is_block());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn feed_rotates_when_it_grows_past_the_cap() {
+        let path = std::env::temp_dir().join("ghost-watchlog-rotate-7781400009.jsonl");
+        let mut rotated_os = path.as_os_str().to_owned();
+        rotated_os.push(".1");
+        let rotated = std::path::PathBuf::from(rotated_os);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&rotated);
+
+        for i in 0..5 {
+            append_call_to(&path, &CallRecord::from_outcome(&pass_outcome(), i));
+        }
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size > 0);
+
+        // rotate with a cap below the current size -> old feed preserved as .1.
+        assert!(super::rotate_feed_if_over(&path, size - 1));
+        assert!(rotated.exists(), "the old feed is kept as events.jsonl.1");
+        assert!(!path.exists(), "the live feed was moved aside");
+
+        // the very next append starts a fresh feed with just that record.
+        append_call_to(&path, &CallRecord::from_outcome(&block_outcome(), 99));
+        assert_eq!(read_all(&path).len(), 1, "fresh feed after rotation");
+
+        // under the cap -> never rotates.
+        assert!(!super::rotate_feed_if_over(&path, MAX_FEED_BYTES));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&rotated);
     }
 
     #[test]
