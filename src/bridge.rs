@@ -45,6 +45,12 @@ pub struct BridgeConfig {
     pub mode: BridgeMode,
     pub narrate_to_agent: bool,
     pub on_sentinel_error: FailMode,
+    /// correlation id for THIS bridged call (one uuid v4 per call, minted at the
+    /// top of the hook). handed to sentinel via SENTINEL_CALL_ID so its audit
+    /// line and our feed line can be joined deterministically. telemetry only:
+    /// None (generation failed, old caller) falls through to the exact
+    /// pre-correlation behavior — an id can never gate a decision.
+    pub call_id: Option<String>,
 }
 
 impl Default for BridgeConfig {
@@ -53,8 +59,28 @@ impl Default for BridgeConfig {
             mode: BridgeMode::Observe,
             narrate_to_agent: true,
             on_sentinel_error: FailMode::Closed,
+            call_id: None,
         }
     }
+}
+
+/// mint a fresh uuid v4 (the per-call correlation id). hand-rolled over the
+/// existing rand dep — ghost doesn't pull a crate for twenty lines. Option on
+/// purpose: if the rng ever panics, the hook must fall through to the exact
+/// no-id behavior instead of dying (rule 3 energy: telemetry never weakens the
+/// hook).
+pub fn new_call_id() -> Option<String> {
+    let mut b: [u8; 16] = std::panic::catch_unwind(rand::random).ok()?;
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // rfc 4122 variant
+    let mut s = String::with_capacity(36);
+    for (i, byte) in b.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            s.push('-');
+        }
+        s.push_str(&format!("{byte:02x}"));
+    }
+    Some(s)
 }
 
 /// what sentinel decided. we only ever *specially handle* a deny. everything
@@ -81,6 +107,21 @@ pub enum BridgeError {
 /// the defense core, mockable for tests.
 pub trait SentinelOracle {
     fn evaluate(&self, payload_json: &str) -> Result<SentinelDecision, BridgeError>;
+
+    /// evaluate the GOVERNING call, tagged with its correlation id. the default
+    /// ignores the id and delegates to `evaluate` (mocks stay one-method); the
+    /// real subprocess oracle overrides this to hand sentinel the id via
+    /// SENTINEL_CALL_ID. shadow probes deliberately keep calling the untagged
+    /// `evaluate` — a probe COPY must never carry the governing call's id, so
+    /// probe telemetry can't be mistaken for the real call in a joined view.
+    fn evaluate_governing(
+        &self,
+        payload_json: &str,
+        call_id: Option<&str>,
+    ) -> Result<SentinelDecision, BridgeError> {
+        let _ = call_id;
+        self.evaluate(payload_json)
+    }
 }
 
 /// result of one bridged tool call.
@@ -107,6 +148,9 @@ pub struct BridgeOutcome {
     /// mode AND sentinel denied (there was something to try evading). the probes
     /// are telemetry — they NEVER influence `hook_stdout`.
     pub shadow: Option<crate::shadow::ShadowReport>,
+    /// the correlation id this call ran under (`cfg.call_id`, echoed back so the
+    /// feed record can carry it). None when no id was minted.
+    pub call_id: Option<String>,
 }
 
 /// THE bridge. pure given an oracle: stdin json -> decorated stdout json + a
@@ -127,7 +171,9 @@ pub fn run_bridge(
     // mode that would rewrite this; not wired yet, so it's parity for now.)
     let payload_for_sentinel = input_json.to_string();
 
-    match oracle.evaluate(&payload_for_sentinel) {
+    // the governing call carries the correlation id; shadow probes (below) go
+    // through the untagged `evaluate` so a probe can never wear the real id.
+    match oracle.evaluate_governing(&payload_for_sentinel, cfg.call_id.as_deref()) {
         Ok(SentinelDecision::Deny { reason }) => {
             let category = BlockCategory::classify(&reason, &command);
             let roast = engine.produce_block_roast(&tool_name, &command, category, recent_ids);
@@ -155,6 +201,7 @@ pub fn run_bridge(
                 category: Some(category),
                 roast_id: Some(roast.id),
                 shadow,
+                call_id: cfg.call_id.clone(),
             }
         }
         Ok(SentinelDecision::PassThrough { raw_json }) => BridgeOutcome {
@@ -168,6 +215,7 @@ pub fn run_bridge(
             category: None,
             roast_id: None,
             shadow: None,
+            call_id: cfg.call_id.clone(),
         },
         Err(e) => {
             // RULE 4: fail closed. couldn't reach the authority -> deny, loudly.
@@ -188,6 +236,7 @@ pub fn run_bridge(
                 // sentinel's unreachable — probing evasions against a dead oracle
                 // is pointless (they'd all just error). no shadow on a fail-closed.
                 shadow: None,
+                call_id: cfg.call_id.clone(),
             }
         }
     }
@@ -285,13 +334,34 @@ impl SubprocessSentinel {
     }
 }
 
-impl SentinelOracle for SubprocessSentinel {
-    fn evaluate(&self, payload_json: &str) -> Result<SentinelDecision, BridgeError> {
-        let mut child = Command::new(&self.cmd)
-            .args(&self.args)
+/// the env var sentinel reads the correlation id from (mirrors sentinel's
+/// `audit_trail::CALL_ID_ENV`).
+pub const SENTINEL_CALL_ID_ENV: &str = "SENTINEL_CALL_ID";
+
+impl SubprocessSentinel {
+    /// shell out to sentinel, tagging the child with `call_id` when given.
+    /// None actively STRIPS the var (not just "doesn't set it"): the hook's own
+    /// environment could carry a stale SENTINEL_CALL_ID, and an untagged eval —
+    /// a shadow probe — must never inherit someone else's id.
+    fn run(
+        &self,
+        payload_json: &str,
+        call_id: Option<&str>,
+    ) -> Result<SentinelDecision, BridgeError> {
+        let mut cmd = Command::new(&self.cmd);
+        cmd.args(&self.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        match call_id {
+            Some(id) => {
+                cmd.env(SENTINEL_CALL_ID_ENV, id);
+            }
+            None => {
+                cmd.env_remove(SENTINEL_CALL_ID_ENV);
+            }
+        }
+        let mut child = cmd
             .spawn()
             .map_err(|e| BridgeError::Unreachable(e.to_string()))?;
         if let Some(mut sin) = child.stdin.take() {
@@ -302,6 +372,21 @@ impl SentinelOracle for SubprocessSentinel {
             .wait_with_output()
             .map_err(|e| BridgeError::Unreachable(e.to_string()))?;
         parse_sentinel_stdout(&String::from_utf8_lossy(&out.stdout))
+    }
+}
+
+impl SentinelOracle for SubprocessSentinel {
+    fn evaluate(&self, payload_json: &str) -> Result<SentinelDecision, BridgeError> {
+        // untagged: this is the path shadow probes take. no id, ever.
+        self.run(payload_json, None)
+    }
+
+    fn evaluate_governing(
+        &self,
+        payload_json: &str,
+        call_id: Option<&str>,
+    ) -> Result<SentinelDecision, BridgeError> {
+        self.run(payload_json, call_id)
     }
 }
 
@@ -715,6 +800,167 @@ mod tests {
         }));
         let out = run_bridge(LS, &engine(), &pass, &cfg, &[]);
         assert!(out.shadow.is_none(), "a pass has nothing to shadow-probe");
+    }
+
+    #[test]
+    fn call_id_flows_from_cfg_to_outcome_on_every_arm() {
+        let cfg = BridgeConfig {
+            call_id: Some("11111111-2222-4333-8444-555555555555".into()),
+            ..BridgeConfig::default()
+        };
+        // deny, pass, and fail-closed all echo the id into the outcome — the
+        // feed record must carry it whatever sentinel said.
+        let arms: Vec<MockSentinel> = vec![
+            MockSentinel(Ok(SentinelDecision::Deny { reason: "x".into() })),
+            MockSentinel(Ok(SentinelDecision::PassThrough {
+                raw_json: "{}".into(),
+            })),
+            MockSentinel(Err(BridgeError::Unreachable("down".into()))),
+        ];
+        for oracle in &arms {
+            let out = run_bridge(CURL_PIPE, &engine(), oracle, &cfg, &[]);
+            assert_eq!(
+                out.call_id.as_deref(),
+                Some("11111111-2222-4333-8444-555555555555")
+            );
+            // and the id stays OFF the wire: stdout is claude code's contract.
+            assert!(!out.hook_stdout.contains("11111111"));
+        }
+        // no id minted -> None, exactly the old behavior.
+        let out = run_bridge(LS, &engine(), &arms[1], &BridgeConfig::default(), &[]);
+        assert!(out.call_id.is_none());
+    }
+
+    #[test]
+    fn governing_call_wears_the_id_shadow_probes_never_do() {
+        // records the id every evaluation arrived with. denies the literal
+        // "| sh" so shadow has something to probe.
+        struct Rec {
+            ids: std::cell::RefCell<Vec<Option<String>>>,
+        }
+        impl Rec {
+            fn eval(
+                &self,
+                payload: &str,
+                id: Option<&str>,
+            ) -> Result<SentinelDecision, BridgeError> {
+                self.ids.borrow_mut().push(id.map(str::to_string));
+                if payload.contains("| sh") {
+                    Ok(SentinelDecision::Deny {
+                        reason: "pipe to shell".into(),
+                    })
+                } else {
+                    Ok(SentinelDecision::PassThrough {
+                        raw_json: "{}".into(),
+                    })
+                }
+            }
+        }
+        impl SentinelOracle for Rec {
+            fn evaluate(&self, payload: &str) -> Result<SentinelDecision, BridgeError> {
+                self.eval(payload, None)
+            }
+            fn evaluate_governing(
+                &self,
+                payload: &str,
+                call_id: Option<&str>,
+            ) -> Result<SentinelDecision, BridgeError> {
+                self.eval(payload, call_id)
+            }
+        }
+
+        let rec = Rec {
+            ids: std::cell::RefCell::new(Vec::new()),
+        };
+        let cfg = BridgeConfig {
+            mode: BridgeMode::ShadowAttack,
+            call_id: Some("the-governing-id".into()),
+            ..BridgeConfig::default()
+        };
+        let out = run_bridge(CURL_PIPE, &engine(), &rec, &cfg, &[]);
+        assert!(out.blocked);
+        assert!(out.shadow.is_some(), "shadow ran on the denial");
+
+        let ids = rec.ids.borrow();
+        assert!(ids.len() > 1, "the governing eval plus shadow probes");
+        assert_eq!(
+            ids[0].as_deref(),
+            Some("the-governing-id"),
+            "the REAL call carries the id"
+        );
+        assert!(
+            ids[1..].iter().all(|id| id.is_none()),
+            "a probe COPY must never wear the governing call's id: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn new_call_id_mints_wellformed_distinct_v4_uuids() {
+        let a = new_call_id().expect("rng works");
+        let b = new_call_id().expect("rng works");
+        assert_ne!(a, b, "two calls, two ids");
+        for id in [&a, &b] {
+            assert_eq!(id.len(), 36);
+            let bytes: Vec<char> = id.chars().collect();
+            for i in [8, 13, 18, 23] {
+                assert_eq!(bytes[i], '-', "hyphen at {i} in {id}");
+            }
+            assert_eq!(bytes[14], '4', "version nibble in {id}");
+            assert!(
+                matches!(bytes[19], '8' | '9' | 'a' | 'b'),
+                "rfc4122 variant nibble in {id}"
+            );
+            assert!(
+                id.chars().all(|c| c == '-' || c.is_ascii_hexdigit()),
+                "lowercase hex only: {id}"
+            );
+        }
+    }
+
+    /// drives the REAL subprocess path: a stand-in sentinel that echoes
+    /// SENTINEL_CALL_ID back in its stdout JSON proves the env var lands in the
+    /// child for the governing call and is STRIPPED (even when the hook's own
+    /// env carries a stale one) for untagged/probe evals.
+    #[cfg(unix)]
+    #[test]
+    fn subprocess_injects_the_id_for_governing_and_strips_it_for_probes() {
+        let echo = SubprocessSentinel::new(
+            "sh",
+            vec![
+                "-c".to_string(),
+                // drain stdin first (like the real sentinel) so the bridge's
+                // payload write can't race the child's exit into an EPIPE.
+                r#"cat >/dev/null; printf '{"seen":"%s"}' "${SENTINEL_CALL_ID:-unset}""#
+                    .to_string(),
+            ],
+        );
+
+        // governing call: the child sees exactly the id we passed.
+        match echo.evaluate_governing("{}", Some("gov-42")).unwrap() {
+            SentinelDecision::PassThrough { raw_json } => {
+                assert_eq!(raw_json, r#"{"seen":"gov-42"}"#)
+            }
+            other => panic!("expected passthrough, got {other:?}"),
+        }
+
+        // poison our own environment, then take the untagged (probe) path: the
+        // child must NOT inherit the stale id. set_var is unsafe in edition
+        // 2024 because it races other threads reading the env — confined to
+        // this one test, restored before it returns.
+        unsafe { std::env::set_var(SENTINEL_CALL_ID_ENV, "stale-leaked-id") };
+        let probe = echo.evaluate("{}");
+        let governing_none = echo.evaluate_governing("{}", None);
+        unsafe { std::env::remove_var(SENTINEL_CALL_ID_ENV) };
+
+        for result in [probe, governing_none] {
+            match result.unwrap() {
+                SentinelDecision::PassThrough { raw_json } => assert_eq!(
+                    raw_json, r#"{"seen":"unset"}"#,
+                    "an untagged eval must never leak an inherited id"
+                ),
+                other => panic!("expected passthrough, got {other:?}"),
+            }
+        }
     }
 
     #[test]

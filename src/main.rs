@@ -205,7 +205,15 @@ fn main() {
             let sentinel_cmd = sentinel.unwrap_or_else(|| "sentinel".to_string());
             let oracle = SubprocessSentinel::new(sentinel_cmd, vec!["evaluate".to_string()]);
 
-            let mut cfg = BridgeConfig::default();
+            // one uuid v4 per bridged call, minted before anything else touches
+            // the call: sentinel gets it via SENTINEL_CALL_ID and stamps its
+            // audit line; our feed record carries the same id — a deterministic
+            // join key across ~/.ghost/events.jsonl and ~/.sentinel/audit.jsonl.
+            // best-effort: None just means this call logs exactly like before.
+            let mut cfg = BridgeConfig {
+                call_id: ghost::bridge::new_call_id(),
+                ..BridgeConfig::default()
+            };
             if let Some(m) = mode.as_deref() {
                 cfg.mode = match m {
                     "shadow-attack" => BridgeMode::ShadowAttack,

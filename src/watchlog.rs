@@ -42,6 +42,14 @@ pub struct CallRecord {
     /// `default` means every older line still parses. 🔬
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shadow: Option<crate::shadow::ShadowReport>,
+    /// correlation id shared with sentinel's audit trail: the bridge mints one
+    /// uuid v4 per call and hands it to the sentinel subprocess via
+    /// SENTINEL_CALL_ID, so this line joins the matching ~/.sentinel/audit.jsonl
+    /// line deterministically. same serde posture as `shadow`: `default` so
+    /// older feed lines still parse (-> None), `skip_serializing_if` so a call
+    /// without an id stays byte-for-byte the old shape. 🔗
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
 }
 
 impl CallRecord {
@@ -57,6 +65,7 @@ impl CallRecord {
             roast: outcome.block_event.clone(),
             roast_id: outcome.roast_id.clone(),
             shadow: outcome.shadow.clone(),
+            call_id: outcome.call_id.clone(),
         }
     }
 
@@ -443,6 +452,7 @@ mod tests {
             category: Some(BlockCategory::CredAccess),
             roast_id: Some("cred-access:2".into()),
             shadow: None,
+            call_id: None,
         }
     }
 
@@ -457,6 +467,7 @@ mod tests {
             category: None,
             roast_id: None,
             shadow: None,
+            call_id: None,
         }
     }
 
@@ -483,6 +494,34 @@ mod tests {
         assert!(!line.contains('\n'), "one record = one line");
         let back = CallRecord::from_jsonl(&line).expect("parse own output");
         assert_eq!(back, rec);
+    }
+
+    #[test]
+    fn call_id_lands_in_the_record_and_roundtrips() {
+        let mut o = block_outcome();
+        o.call_id = Some("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".into());
+        let rec = CallRecord::from_outcome(&o, 7);
+        assert_eq!(
+            rec.call_id.as_deref(),
+            Some("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+        );
+        let line = rec.to_jsonl();
+        assert!(line.contains("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"));
+        assert_eq!(CallRecord::from_jsonl(&line).unwrap(), rec);
+
+        // no id minted -> the line stays byte-for-byte the old shape.
+        let bare = CallRecord::from_outcome(&pass_outcome(), 7);
+        assert!(bare.call_id.is_none());
+        assert!(!bare.to_jsonl().contains("call_id"));
+    }
+
+    #[test]
+    fn old_feed_lines_without_call_id_still_parse() {
+        // a literal pre-call_id feed line, exactly as older ghosts wrote it.
+        let old = r#"{"ts_ms":1,"tool":"Bash","command":"ls -la","decision":"pass","category":null,"roast":null,"roast_id":null}"#;
+        let rec = CallRecord::from_jsonl(old).expect("old lines must keep parsing");
+        assert!(rec.call_id.is_none());
+        assert_eq!(rec.tool, "Bash");
     }
 
     #[test]
@@ -704,6 +743,7 @@ mod tests {
             roast: Some("blocked 💀".into()),
             roast_id: Some(format!("{cat}:0")),
             shadow: None,
+            call_id: None,
         }
     }
     fn pass(tool: &str, cmd: &str) -> CallRecord {
@@ -716,6 +756,7 @@ mod tests {
             roast: None,
             roast_id: None,
             shadow: None,
+            call_id: None,
         }
     }
 
@@ -882,6 +923,7 @@ mod tests {
             roast: Some("blocked".into()),
             roast_id: Some(id.into()),
             shadow: None,
+            call_id: None,
         };
         append_call_to(&path, &mk_block("cred-access:0"));
         append_call_to(&path, &pass_call()); // a pass in the middle
