@@ -16,7 +16,7 @@ use crate::event::GhostFaceState;
 use crate::personality::{BlockCategory, PersonalityEngine};
 use serde_json::Value;
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 
 /// how aggressive ghost's offense is on the way in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -318,9 +318,12 @@ pub fn parse_tool_use_id(input_json: &str) -> Option<String> {
 pub fn parse_sentinel_stdout(stdout: &str) -> Result<SentinelDecision, BridgeError> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
-        return Ok(SentinelDecision::PassThrough {
-            raw_json: "{}".to_string(),
-        });
+        // empty stdout is NOT a defer. sentinel's defer is the explicit `{}` object
+        // it prints on a clean allow (HookOutput::allow); nothing at all means it
+        // died before it could speak. fail CLOSED. RULE 4 >:[ they ALL talk XX
+        return Err(BridgeError::Unreachable(
+            "sentinel produced empty stdout".to_string(),
+        ));
     }
     let v: Value = serde_json::from_str(trimmed)
         .map_err(|e| BridgeError::BadOutput(format!("{e}: {trimmed}")))?;
@@ -339,6 +342,27 @@ pub fn parse_sentinel_stdout(stdout: &str) -> Result<SentinelDecision, BridgeErr
         _ => Ok(SentinelDecision::PassThrough {
             raw_json: trimmed.to_string(),
         }),
+    }
+}
+
+/// combine sentinel's exit status with its stdout into a decision. RULE 4: fail
+/// CLOSED unless we can positively read either a well-formed deny or a clean-exit
+/// defer. a well-formed deny is honored regardless of exit code (a block also
+/// exits 2 — never downgrade a deny, RULE 1); a defer (`{}`) is trusted ONLY from
+/// a zero exit, because a non-zero exit means sentinel crashed mid-decision and
+/// its "pass" is worthless. empty/junk stdout already fails closed inside
+/// parse_sentinel_stdout. they ALL talk eventually XX 💀
+pub fn decide_from_exit(status: ExitStatus, stdout: &str) -> Result<SentinelDecision, BridgeError> {
+    match parse_sentinel_stdout(stdout)? {
+        deny @ SentinelDecision::Deny { .. } => Ok(deny),
+        pass @ SentinelDecision::PassThrough { .. } if status.success() => Ok(pass),
+        SentinelDecision::PassThrough { .. } => Err(BridgeError::Unreachable(format!(
+            "sentinel exited {} without a deny — its defer is worthless, failing closed",
+            status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "on a signal".into()),
+        ))),
     }
 }
 
@@ -395,7 +419,9 @@ impl SubprocessSentinel {
         let out = child
             .wait_with_output()
             .map_err(|e| BridgeError::Unreachable(e.to_string()))?;
-        parse_sentinel_stdout(&String::from_utf8_lossy(&out.stdout))
+        // RULE 4: fold in the exit status, not just stdout. a sentinel that dies
+        // with empty/garbage output must fail CLOSED, never defer. >:[
+        decide_from_exit(out.status, &String::from_utf8_lossy(&out.stdout))
     }
 }
 
@@ -723,9 +749,64 @@ mod tests {
             SentinelDecision::PassThrough { raw_json } => assert_eq!(raw_json, "{}"),
             _ => panic!("expected passthrough"),
         }
-        match parse_sentinel_stdout("").unwrap() {
-            SentinelDecision::PassThrough { raw_json } => assert_eq!(raw_json, "{}"),
-            _ => panic!("empty defers"),
+        // empty stdout is NO LONGER a defer — it fails closed (RULE 4). sentinel's
+        // real defer is the explicit `{}`; nothing at all means it died mid-decision.
+        assert!(
+            parse_sentinel_stdout("").is_err(),
+            "empty stdout must fail closed, not defer"
+        );
+    }
+
+    #[cfg(unix)]
+    fn exit(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        // raw wait status: exit code lives in the high byte.
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn decide_empty_stdout_denies_on_any_exit() {
+        // sentinel died before speaking -> fail closed regardless of exit code.
+        assert!(
+            decide_from_exit(exit(0), "").is_err(),
+            "empty+exit0 must deny"
+        );
+        assert!(
+            decide_from_exit(exit(1), "").is_err(),
+            "empty+exit1 must deny"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn decide_nonzero_exit_defer_denies() {
+        // a `{}` defer from a crashed (non-zero) sentinel is worthless -> fail closed.
+        assert!(
+            decide_from_exit(exit(1), "{}").is_err(),
+            "defer from a non-zero exit must fail closed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn decide_clean_exit_defer_passes() {
+        match decide_from_exit(exit(0), "{}") {
+            Ok(SentinelDecision::PassThrough { raw_json }) => assert_eq!(raw_json, "{}"),
+            other => panic!("clean-exit `{{}}` must pass through, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn decide_deny_honored_regardless_of_exit() {
+        let deny = r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"pipe to shell"}}"#;
+        // a block exits 2; but never downgrade a well-formed deny, whatever the code.
+        for code in [0, 2] {
+            match decide_from_exit(exit(code), deny) {
+                Ok(SentinelDecision::Deny { reason }) => assert!(reason.contains("pipe to shell")),
+                other => panic!("deny must be honored at exit {code}, got {other:?}"),
+            }
         }
     }
 
