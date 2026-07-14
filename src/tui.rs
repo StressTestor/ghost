@@ -1046,6 +1046,7 @@ mod tests {
             roast_id: None,
             shadow: None,
             call_id: None,
+            tool_use_id: None,
         };
         app.ingest_call(&pass);
         assert_eq!(app.face, GhostFaceState::SideEye, "a pass -> side-eye");
@@ -1062,6 +1063,7 @@ mod tests {
             roast_id: Some("cred-access:3".into()),
             shadow: None,
             call_id: None,
+            tool_use_id: None,
         };
         app.ingest_call(&block);
         assert_eq!(
