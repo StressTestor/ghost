@@ -50,6 +50,13 @@ pub struct CallRecord {
     /// without an id stays byte-for-byte the old shape. 🔗
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_id: Option<String>,
+    /// claude code's per-call tool_use_id, from the hook payload. the same value
+    /// shows up in sentinel's pre AND post audit lines, so with call_id this
+    /// makes the feed line joinable to everything: feed <-> sentinel-pre via
+    /// call_id, sentinel-pre <-> sentinel-post via tool_use_id. same serde
+    /// posture as roast_id/shadow/call_id: old lines parse, absent stays absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<String>,
 }
 
 impl CallRecord {
@@ -66,6 +73,7 @@ impl CallRecord {
             roast_id: outcome.roast_id.clone(),
             shadow: outcome.shadow.clone(),
             call_id: outcome.call_id.clone(),
+            tool_use_id: outcome.tool_use_id.clone(),
         }
     }
 
@@ -453,6 +461,7 @@ mod tests {
             roast_id: Some("cred-access:2".into()),
             shadow: None,
             call_id: None,
+            tool_use_id: None,
         }
     }
 
@@ -468,6 +477,7 @@ mod tests {
             roast_id: None,
             shadow: None,
             call_id: None,
+            tool_use_id: None,
         }
     }
 
@@ -521,7 +531,36 @@ mod tests {
         let old = r#"{"ts_ms":1,"tool":"Bash","command":"ls -la","decision":"pass","category":null,"roast":null,"roast_id":null}"#;
         let rec = CallRecord::from_jsonl(old).expect("old lines must keep parsing");
         assert!(rec.call_id.is_none());
+        assert!(rec.tool_use_id.is_none());
         assert_eq!(rec.tool, "Bash");
+    }
+
+    #[test]
+    fn tool_use_id_lands_in_the_record_and_prior_generation_lines_parse() {
+        let mut o = pass_outcome();
+        o.tool_use_id = Some("toolu_01QoWqbiPYgBoiZQPDuvUHKb".into());
+        let rec = CallRecord::from_outcome(&o, 3);
+        assert_eq!(
+            rec.tool_use_id.as_deref(),
+            Some("toolu_01QoWqbiPYgBoiZQPDuvUHKb")
+        );
+        assert_eq!(CallRecord::from_jsonl(&rec.to_jsonl()).unwrap(), rec);
+
+        // a call_id-era line (previous generation: call_id, no tool_use_id).
+        let prev = r#"{"ts_ms":1,"tool":"Bash","command":"ls","decision":"pass","category":null,"roast":null,"roast_id":null,"call_id":"a8e91183-e40b-4130-832d-19877007477f"}"#;
+        let rec = CallRecord::from_jsonl(prev).expect("call_id-era lines must keep parsing");
+        assert_eq!(
+            rec.call_id.as_deref(),
+            Some("a8e91183-e40b-4130-832d-19877007477f")
+        );
+        assert!(rec.tool_use_id.is_none());
+
+        // no id -> no key on the wire, exactly like call_id/shadow.
+        assert!(
+            !CallRecord::from_outcome(&pass_outcome(), 0)
+                .to_jsonl()
+                .contains("tool_use_id")
+        );
     }
 
     #[test]
@@ -744,6 +783,7 @@ mod tests {
             roast_id: Some(format!("{cat}:0")),
             shadow: None,
             call_id: None,
+            tool_use_id: None,
         }
     }
     fn pass(tool: &str, cmd: &str) -> CallRecord {
@@ -757,6 +797,7 @@ mod tests {
             roast_id: None,
             shadow: None,
             call_id: None,
+            tool_use_id: None,
         }
     }
 
@@ -924,6 +965,7 @@ mod tests {
             roast_id: Some(id.into()),
             shadow: None,
             call_id: None,
+            tool_use_id: None,
         };
         append_call_to(&path, &mk_block("cred-access:0"));
         append_call_to(&path, &pass_call()); // a pass in the middle
