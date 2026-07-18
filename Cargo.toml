@@ -1,7 +1,29 @@
 [package]
-name = "ghost"
+name = "ghost-chaos"
 version = "0.1.0"
 edition = "2024"
+description = "live visibility and deliberate chaos for CLI AI agents: watch, roast, poke, and mutate tool calls. the offensive counterpart to sentinel-guard."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/StressTestor/ghost"
+homepage = "https://github.com/StressTestor/ghost"
+documentation = "https://github.com/StressTestor/ghost#readme"
+readme = "README.md"
+keywords = ["security", "llm", "agent", "chaos", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [
+  "recordings/",
+  "docs/*.cast",
+  "docs/*.gif",
+  ".github/",
+]
+
+[lib]
+name = "ghost"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ghost"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
