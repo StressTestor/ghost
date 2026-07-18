@@ -571,7 +571,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ghost"
+name = "ghost-chaos"
 version = "0.1.0"
 dependencies = [
  "clap",
