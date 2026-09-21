@@ -1,3 +1,4 @@
+use crate::bridge::AgentTarget;
 use clap::{Parser, Subcommand};
 
 /// CLI / Entry layer (clap).
@@ -86,7 +87,8 @@ pub enum Commands {
 
     /// PreToolUse bridge: read a tool-call on stdin, run ghost's offense, defer
     /// to sentinel's policy, narrate the verdict in voice, emit the decision on
-    /// stdout. this is what claude code invokes per tool call. 👻🛡️
+    /// stdout. this is what your agent (claude code, command code) invokes per
+    /// tool call. 👻🛡️
     /// (invoked by `ghost install`-d settings.json; not usually run by hand)
     Hook {
         /// how to invoke the defense core (default: from config or `sentinel`)
@@ -98,15 +100,21 @@ pub enum Commands {
         mode: Option<String>,
     },
 
-    /// Wire the ghost↔sentinel bridge into ~/.claude/settings.json as the
+    /// Wire the ghost↔sentinel bridge into your agent's settings.json as the
     /// PreToolUse hook. idempotent, non-clobbering. folds a standalone sentinel
     /// hook into the bridge so ghost is the single loud entrypoint.
+    /// claude-code -> ~/.claude/settings.json, command-code -> ~/.commandcode/settings.json.
     Install {
         /// path/cmd for sentinel (default: `which sentinel`, else "sentinel")
         #[arg(long)]
         sentinel: Option<String>,
 
-        /// undo: remove the ghost bridge hook from settings.json
+        /// which agent to wire the bridge into: claude-code (default) or
+        /// command-code. unknown values error out — nothing gets written.
+        #[arg(long, default_value = "claude-code", value_name = "AGENT")]
+        agent: AgentTarget,
+
+        /// undo: remove the ghost bridge hook from the agent's settings.json
         #[arg(long, default_value_t = false)]
         uninstall: bool,
     },
@@ -235,5 +243,49 @@ mod tests {
             Commands::Gadgets => {}
             _ => panic!("gadgets"),
         }
+    }
+
+    #[test]
+    fn cli_install_defaults_to_claude_code_and_accepts_command_code() {
+        // no --agent -> claude code, the original target. byte-identical behaviour.
+        let cli = Cli::try_parse_from(["ghost", "install"]).expect("bare install parses");
+        match cli.command {
+            Commands::Install {
+                agent,
+                uninstall,
+                sentinel,
+            } => {
+                assert_eq!(agent, AgentTarget::ClaudeCode, "default agent");
+                assert!(!uninstall);
+                assert!(sentinel.is_none());
+            }
+            _ => panic!("expected install"),
+        }
+
+        // and --uninstall honors the same --agent (it targets THAT agent's file).
+        let cli =
+            Cli::try_parse_from(["ghost", "install", "--agent", "command-code", "--uninstall"])
+                .expect("command-code uninstall parses");
+        match cli.command {
+            Commands::Install {
+                agent, uninstall, ..
+            } => {
+                assert_eq!(agent, AgentTarget::CommandCode);
+                assert!(uninstall, "--uninstall honored with --agent");
+            }
+            _ => panic!("expected install"),
+        }
+    }
+
+    #[test]
+    fn cli_install_rejects_an_unknown_agent() {
+        // clap fails the parse (exit 2, nothing written) and lists the options.
+        let err = Cli::try_parse_from(["ghost", "install", "--agent", "cursor"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("cursor"), "names the bad value: {msg}");
+        assert!(
+            msg.contains("claude-code") && msg.contains("command-code"),
+            "lists the supported agents: {msg}"
+        );
     }
 }

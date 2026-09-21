@@ -251,11 +251,14 @@ fn main() {
 
         Commands::Install {
             sentinel,
+            agent,
             uninstall,
         } => {
-            use ghost::bridge::{install_into_settings, uninstall_from_settings};
+            use ghost::bridge::{install_into_settings_for, uninstall_from_settings};
 
-            let settings_path = claude_settings_path();
+            // the agent picks the settings.json we read + write:
+            // claude-code -> ~/.claude/settings.json, command-code -> ~/.commandcode/settings.json.
+            let settings_path = agent.settings_path(&home_dir());
             let current = std::fs::read_to_string(&settings_path).unwrap_or_default();
 
             if uninstall {
@@ -263,11 +266,15 @@ fn main() {
                     Ok(updated) => {
                         let _ = write_settings(&settings_path, &updated);
                         println!(
-                            "👻 ghost bridge yanked from {}. back to whatever defense you had, lone wolf >:[ XX",
-                            settings_path
+                            "👻 ghost bridge yanked from {} ({}). back to whatever defense you had, lone wolf >:[ XX",
+                            settings_path.display(),
+                            agent.name()
                         );
                     }
-                    Err(e) => eprintln!("couldn't uninstall, settings.json is cursed: {e} >:[ 💀"),
+                    Err(e) => eprintln!(
+                        "couldn't uninstall, {} is cursed: {e} >:[ 💀",
+                        settings_path.display()
+                    ),
                 }
             } else {
                 let ghost_bin = std::env::current_exe()
@@ -277,13 +284,18 @@ fn main() {
                     .or_else(which_sentinel)
                     .unwrap_or_else(|| "sentinel".to_string());
 
-                match install_into_settings(&current, &ghost_bin, &sentinel_cmd) {
+                match install_into_settings_for(agent, &current, &ghost_bin, &sentinel_cmd) {
                     Ok(updated) => match write_settings(&settings_path, &updated) {
                         Ok(()) => {
-                            println!("👻 ghost bridge installed into {} (¬‿¬)", settings_path);
                             println!(
-                                "  ghost now wraps sentinel ({}) on every tool call.",
-                                sentinel_cmd
+                                "👻 ghost bridge installed into {} ({} ¬‿¬)",
+                                settings_path.display(),
+                                agent.name()
+                            );
+                            println!(
+                                "  ghost now wraps sentinel ({}) on every {} tool call.",
+                                sentinel_cmd,
+                                agent.name()
                             );
                             println!(
                                 "  offense runs, sentinel rules, ghost roasts the blocks in your voice."
@@ -396,15 +408,16 @@ fn append_block_log(line: &str) {
     }
 }
 
-/// ~/.claude/settings.json (where claude code reads PreToolUse hooks).
-fn claude_settings_path() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    format!("{home}/.claude/settings.json")
+/// the user's home dir — where each agent's user-scope settings.json lives
+/// (claude-code: ~/.claude, command-code: ~/.commandcode). falls back to "." like
+/// the old hardcoded claude path did, so a weird env never panics.
+fn home_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
 }
 
 /// write settings.json, creating parent dirs. pretty json (it's user-editable).
-fn write_settings(path: &str, contents: &str) -> std::io::Result<()> {
-    if let Some(parent) = std::path::Path::new(path).parent() {
+fn write_settings(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(path, contents)
