@@ -53,16 +53,28 @@ sentinel blocks the dangerous tool calls. ghost makes sure the agent feels bad a
 
 `ghost install` puts ghost in front of sentinel as the PreToolUse hook. on every tool call ghost runs its offense, hands the call to sentinel's policy, and when sentinel blocks something the agent tried, ghost roasts it in your voice. the agent reads the roast in the deny reason. you read it in `~/.ghost/blocks.log`.
 
+`--agent` says which agent's settings.json gets wired (default `claude-code`, which is byte-for-byte what ghost has always written). command code is the second target: same hooks schema, same bridge entry, its own file. unknown values error out and nothing gets written.
+
+| `--agent` | settings.json | notes |
+|---|---|---|
+| `claude-code` (default, alias `claude`) | `~/.claude/settings.json` | the original target |
+| `command-code` (alias `commandcode`) | `~/.commandcode/settings.json` | parent dirs created if missing; every unrelated key + hook preserved |
+
+its tool names (`shell_command`, `read_file`, `write_file`, `edit_file` — the file tools carry the path in `absolute_path`) show up in the feed with the real command/path, same as claude code's. the decision contract is identical on both: nested deny to block, `{}` to defer.
+
 ```bash
 # wire it up (idempotent, folds a standalone sentinel hook into the bridge)
 ghost install --sentinel /path/to/sentinel
 
-# what claude code runs per tool call (you don't run this by hand):
+# command code instead of claude code (same bridge, its own settings.json)
+ghost install --agent command-code --sentinel /path/to/sentinel
+
+# what your agent runs per tool call (you don't run this by hand):
 printf '%s' '{"tool_name":"Bash","tool_input":{"command":"<a blocked thing>"}}' \
   | ghost hook --sentinel /path/to/sentinel
 # block -> nested deny with the roast grafted into the reason
 #   "...credential vault was reached for. 👻 oh you wanted the secrets. cute. denied (｡◕‿↼) lmao XX"
-# allow -> {} (defers to claude code's normal prompt)
+# allow -> {} (defers to the agent's normal prompt)
 ```
 
 ghost is offense bolted onto defense, never a way around it:
@@ -71,7 +83,7 @@ ghost is offense bolted onto defense, never a way around it:
 - fails closed if sentinel is unreachable.
 - observe mode (default) never mutates the real payload.
 
-the roasts vary per block category (cred-access, pipe-to-shell, destructive, persistence, exfil) and are loud as hell. uninstall with `ghost install --uninstall`. full design in `docs/superpowers/specs/2026-06-14-ghost-sentinel-bridge-design.md`.
+the roasts vary per block category (cred-access, pipe-to-shell, destructive, persistence, exfil) and are loud as hell. uninstall with `ghost install --uninstall` (add `--agent command-code` to pull it back out of command code). full design in `docs/superpowers/specs/2026-06-14-ghost-sentinel-bridge-design.md`.
 
 ### watch it live
 
@@ -129,7 +141,7 @@ Commands:
   run      Run from a full config file (toml)
   replay   Replay a previous session recording (.txt voice, or structured .jsonl)
   hook     PreToolUse bridge: run offense, defer to sentinel, narrate the verdict
-  install  Wire the ghost↔sentinel bridge into ~/.claude/settings.json
+  install  Wire the ghost↔sentinel bridge into your agent's settings.json (--agent claude-code|command-code)
   watch    Tail the bridge feed live and drive the ghost face in real time
   blocks   What your agent kept trying: blocks by category / tool / command
   gadgets  List available gadgets with your voice descriptions + hotkeys
@@ -181,8 +193,10 @@ ghost replay <session-id>
 ghost watch [--path <feed.jsonl>]    # tail the bridge feed live, face reacts in real time
 ghost blocks [--path <feed.jsonl>]   # what your agent kept trying: blocks by category/tool/command
 ghost gadgets
-ghost install --sentinel <path>      # wire the bridge into claude code (wraps sentinel)
-ghost hook --sentinel <path>         # the per-call bridge (claude code invokes this)
+ghost install --sentinel <path>      # wire the bridge into claude code (default; wraps sentinel)
+ghost install --agent command-code --sentinel <path>   # ...or into command code (~/.commandcode/settings.json)
+ghost install --uninstall [--agent command-code]       # pull the bridge back out
+ghost hook --sentinel <path>         # the per-call bridge (your agent invokes this)
 ghost --help
 ```
 
